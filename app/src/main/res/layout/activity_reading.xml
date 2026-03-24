@@ -1,0 +1,362 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#F0F4F8"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="14dp">
+
+        <TextView
+            android:layout_gravity="center"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textSize="16sp"
+            android:textStyle="bold"
+            android:text="v2.0-beta"
+            android:padding="8dp"
+            android:textColor="#1565C0"
+            />
+
+        <!-- HEADER -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:background="#1565C0"
+            android:padding="14dp"
+            android:gravity="center_vertical"
+            android:layout_marginBottom="12dp">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="CescRaj Meter Reader"
+                android:textColor="#FFFFFF"
+                android:textSize="18sp"
+                android:textStyle="bold" />
+
+            <EditText
+                android:id="@+id/txtuser"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:enabled="false"
+                android:textSize="13sp"
+                android:textColor="#BBDEFB"
+                android:background="@null"
+                android:text="OPERATOR" />
+        </LinearLayout>
+
+        <!-- USB STATUS -->
+        <TextView
+            android:id="@+id/tvUsbStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="USB: Checking..."
+            android:textColor="#FFFFFF"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:padding="12dp"
+            android:gravity="center"
+            android:background="#1565C0"
+            android:layout_marginBottom="12dp" />
+
+        <!-- CONFIG CARD -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="#FFFFFF"
+            android:padding="16dp"
+            android:layout_marginBottom="12dp"
+            android:elevation="3dp">
+
+            <!-- Meter Make row: label + spinner + AUTO badge -->
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Meter Make"
+                android:textColor="#1565C0"
+                android:textSize="15sp"
+                android:textStyle="bold"
+                android:layout_marginBottom="4dp" />
+
+            <Spinner
+                android:id="@+id/ddlMeterMake"
+                android:layout_width="match_parent"
+                android:layout_height="52dp"
+                android:background="#E3F2FD"
+                android:paddingLeft="10dp"
+                android:paddingRight="10dp"
+                android:layout_marginBottom="4dp" />
+
+            <!-- Auto-detect status hint -->
+            <TextView
+                android:id="@+id/tvAutoDetectHint"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="⚡ Auto Detect selected — app will identify meter automatically"
+                android:textColor="#1565C0"
+                android:textSize="12sp"
+                android:paddingBottom="10dp" />
+
+            <!-- Data to Read -->
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Data to Read"
+                android:textColor="#1565C0"
+                android:textSize="15sp"
+                android:textStyle="bold"
+                android:layout_marginBottom="4dp" />
+
+            <Spinner
+                android:id="@+id/ddldatatoberead"
+                android:layout_width="match_parent"
+                android:layout_height="52dp"
+                android:background="#E3F2FD"
+                android:paddingLeft="10dp"
+                android:paddingRight="10dp"
+                android:layout_marginBottom="14dp" />
+
+            <!-- Load Profile Days: label + minus + value + plus -->
+            <LinearLayout
+                android:visibility="gone"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_weight="1"
+                    android:layout_height="wrap_content"
+                    android:text="Load Profile Days"
+                    android:textColor="#1565C0"
+                    android:textSize="15sp"
+                    android:textStyle="bold" />
+
+                <Button
+                    android:id="@+id/btnLpMinus"
+                    android:layout_width="44dp"
+                    android:layout_height="44dp"
+                    android:text="−"
+                    android:textSize="20sp"
+                    android:textStyle="bold"
+                    android:textColor="#1565C0"
+                    android:background="#E3F2FD"
+                    android:padding="0dp"
+                    android:onClick="onBtnLpMinusClicked" />
+
+                <EditText
+                    android:id="@+id/txtloadprofile"
+                    android:layout_width="60dp"
+                    android:layout_height="44dp"
+                    android:textSize="18sp"
+                    android:textColor="#212121"
+                    android:textStyle="bold"
+                    android:background="#F5F9FF"
+                    android:gravity="center"
+                    android:text="7"
+                    android:inputType="number"
+                    android:layout_marginLeft="6dp"
+                    android:layout_marginRight="6dp" />
+
+                <Button
+                    android:id="@+id/btnLpPlus"
+                    android:layout_width="44dp"
+                    android:layout_height="44dp"
+                    android:text="+"
+                    android:textSize="20sp"
+                    android:textStyle="bold"
+                    android:textColor="#1565C0"
+                    android:background="#E3F2FD"
+                    android:padding="0dp"
+                    android:onClick="onBtnLpPlusClicked" />
+            </LinearLayout>
+        </LinearLayout>
+
+        <!-- REFRESH USB BUTTON -->
+        <Button
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:text="REFRESH USB STATUS"
+            android:textColor="#1565C0"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:background="#FFFFFF"
+            android:layout_marginBottom="8dp"
+            android:elevation="2dp"
+            android:onClick="onBtnRefreshUsbClicked" />
+
+        <!-- DOWNLOAD + ABORT BUTTONS -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginBottom="10dp">
+
+            <Button
+                android:id="@+id/btnReadWithTheft"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="64dp"
+                android:text="DOWNLOAD METER DATA"
+                android:textColor="#FFFFFF"
+                android:textSize="16sp"
+                android:textStyle="bold"
+                android:background="#1565C0"
+                android:layout_marginEnd="8dp"
+                android:elevation="4dp"
+                android:onClick="onbtnReadWithTheftClicked" />
+
+            <Button
+                android:id="@+id/btnAbort"
+                android:layout_width="110dp"
+                android:layout_height="64dp"
+                android:text="ABORT"
+                android:textColor="#FFFFFF"
+                android:textSize="16sp"
+                android:textStyle="bold"
+                android:background="#C62828"
+                android:enabled="false"
+                android:elevation="4dp"
+                android:onClick="onBtnAbortClicked" />
+        </LinearLayout>
+
+        <!-- CURRENT STATUS -->
+        <TextView
+            android:id="@+id/tvCurrentStep"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Ready — connect USB optical cable and press Download."
+            android:textColor="#1565C0"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:padding="12dp"
+            android:background="#FFFFFF"
+            android:layout_marginBottom="6dp"
+            android:elevation="2dp" />
+
+        <!-- PROGRESS BAR -->
+        <ProgressBar
+            android:id="@+id/progressBarReading"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="match_parent"
+            android:layout_height="14dp"
+            android:max="100"
+            android:progress="0"
+            android:progressTint="#1565C0"
+            android:progressBackgroundTint="#BBDEFB"
+            android:layout_marginBottom="8dp" />
+
+        <!-- ACTIVITY LOG -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="#FFFFFF"
+            android:padding="12dp"
+            android:layout_marginBottom="14dp"
+            android:elevation="2dp">
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Activity Log"
+                android:textColor="#1565C0"
+                android:textSize="13sp"
+                android:textStyle="bold"
+                android:layout_marginBottom="6dp" />
+
+            <ScrollView
+                android:id="@+id/scrollProgressLog"
+                android:layout_width="match_parent"
+                android:layout_height="320dp"
+                android:background="#F5F9FF"
+                android:padding="6dp">
+
+                <TextView
+                    android:id="@+id/tvProgressLog"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:textColor="#212121"
+                    android:textSize="12sp"
+                    android:fontFamily="monospace"
+                    android:lineSpacingExtra="3dp"
+                    android:text="" />
+            </ScrollView>
+        </LinearLayout>
+
+        <!-- HIDDEN FIELDS (required by underlying code) -->
+        <TextView android:id="@+id/lbConsumerNo"
+            android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:visibility="gone" android:text="" />
+        <TextView android:id="@+id/lbMeterNo"
+            android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:visibility="gone" android:text="" />
+        <TextView android:id="@+id/lbName"
+            android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:visibility="gone" android:text="" />
+        <TextView android:id="@+id/lbAddress"
+            android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:visibility="gone" android:text="" />
+        <TextView android:id="@+id/lbStreet"
+            android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:visibility="gone" android:text="" />
+        <TextView android:id="@+id/lbablbelnr"
+            android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:visibility="gone" android:text="" />
+        <TextView android:id="@+id/lbtportion"
+            android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:visibility="gone" android:text="" />
+        <EditText android:id="@+id/txtConsumerNo"
+            android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:visibility="gone" android:text="" />
+        <RadioGroup android:id="@+id/radTheftInfo"
+            android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:visibility="gone">
+            <RadioButton android:id="@+id/radTheftYes"
+                android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:text="Yes"/>
+            <RadioButton android:id="@+id/radTheftno"
+                android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:checked="true" android:text="No"/>
+        </RadioGroup>
+        <Spinner android:id="@+id/actualRead"
+            android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:visibility="gone" />
+        <Spinner android:id="@+id/ddlMCBType"
+            android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:visibility="gone" />
+        <Spinner android:id="@+id/ddlMeterLocation"
+            android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:visibility="gone" />
+        <ImageView android:id="@+id/imageView1"
+            android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:visibility="gone" />
+        <TextView android:id="@+id/hidden_Image"
+            android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:visibility="gone" android:text="" />
+        <TextView android:id="@+id/Status"
+            android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:visibility="gone" android:text="" />
+        <Button android:id="@+id/btnReadWithoutTheft"
+            android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:visibility="gone" android:text=""
+            android:onClick="onbtnReadWithoutTheftClicked"/>
+        <Button android:id="@+id/btnManualRead"
+            android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:visibility="gone" android:text=""
+            android:onClick="onbtnManualReading"/>
+        <Button android:id="@+id/button1"
+            android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:visibility="gone" android:text=""
+            android:onClick="onShowPhotoClicked"/>
+    </LinearLayout>
+</ScrollView>

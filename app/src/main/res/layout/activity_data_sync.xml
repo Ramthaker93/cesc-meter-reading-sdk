@@ -1,0 +1,181 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TableLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/tableLayout1"
+    android:layout_width="fill_parent"
+    android:background="@color/common_google_signin_btn_text_dark_disabled"
+    android:layout_height="fill_parent" >
+
+
+
+    <TableRow
+        android:id="@+id/tableRow1"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+
+        android:padding="2dip" >
+        <TextView
+            android:id="@+id/lbtCap"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textStyle="bold"
+            android:layout_marginTop="5dp"
+            android:text="Data Sync" />
+
+        <TextView
+            android:id="@+id/lbVcpId"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:enabled="false"
+            android:textStyle="bold"
+            android:textColor="#335EFF"
+            android:layout_marginTop="5dp"
+            android:text="" />
+    </TableRow>
+
+    <TableRow
+        android:id="@+id/tableRow2"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:padding="2dip" >
+
+        <TextView
+            android:id="@+id/lbtMonth"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textStyle="bold"
+            android:layout_marginTop="25dp"
+            android:text="Select Month" />
+        <Spinner
+            android:id="@+id/ddmonth"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_alignParentStart="true"
+            android:layout_marginTop="25dp"
+            android:layout_below="@+id/textview"/>
+
+    </TableRow>
+    <TableRow
+        android:id="@+id/tableRow3"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:padding="2dip" >
+
+        <TextView
+            android:id="@+id/lbtYear"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textStyle="bold"
+            android:layout_marginTop="25dp"
+            android:text="Select Year" />
+
+        <Spinner
+            android:id="@+id/ddyear"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_alignParentStart="true"
+            android:layout_marginTop="25dp"
+            android:layout_below="@+id/ddmonth"
+            />
+    </TableRow>
+    <TableRow
+        android:id="@+id/tableRow4"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:padding="2dip" >
+    <CheckBox
+        android:id="@+id/chkpayment"
+        android:layout_width="wrap_content"
+
+        android:layout_height="wrap_content"
+        android:layout_below="@+id/ddyear"
+        android:layout_centerHorizontal="true"
+        android:layout_marginTop="40dp"
+        android:textColor="#FF5733"
+        android:textSize="18dp"
+        android:text="Payment" />
+    </TableRow>
+
+    <TableRow
+        android:id="@+id/tableRow8"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:padding="10dip" >
+        <TextView
+            android:id="@+id/lbMessage"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_span="2"
+            android:maxLines="2"
+            android:lines="2"
+            android:textStyle="bold"
+            android:text="" />
+    </TableRow>
+    <TableRow
+        android:id="@+id/tableRow5"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:padding="2dip" >
+
+        <Button
+            android:id="@+id/btndownload"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_below="@+id/chkpayment"
+            android:layout_alignParentStart="true"
+            android:layout_marginStart="38dp"
+            android:layout_marginTop="50dp"
+            android:width="120dp"
+            android:onClick="onbtnDownload"
+            android:text="Download"
+            android:textColor="#FF5733" />
+
+        <Button
+            android:id="@+id/btnupload"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_alignBaseline="@+id/btndownload"
+            android:layout_alignBottom="@+id/btndownload"
+            android:layout_alignEnd="@+id/textview"
+            android:layout_marginTop="50dp"
+            android:width="120dp"
+            android:text="Upload"
+            android:onClick="onbtnUpload"
+            android:textColor="#FF5733" />
+    </TableRow>
+
+    <TableRow
+        android:id="@+id/tableRow6"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:padding="2dip" >
+        <Button
+            android:id="@+id/btnClearData"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_alignParentStart="true"
+            android:layout_below="@+id/chkpayment"
+            android:layout_marginStart="5dp"
+            android:layout_marginTop="10dp"
+            android:width="120dp"
+            android:text="Clear Data All"
+            android:onClick="onbtnClearClick"
+            android:textColor="#FF5733" />
+
+        <Button
+            android:id="@+id/btnGetDBLoaction"
+            android:layout_width="146dp"
+            android:layout_height="wrap_content"
+            android:layout_alignBaseline="@+id/btndownload"
+            android:layout_alignBottom="@+id/btndownload"
+            android:layout_alignEnd="@+id/textview"
+            android:layout_marginStart="5dp"
+            android:layout_marginTop="10dp"
+            android:width="120dp"
+            android:onClick="onbtnGetDBLocationClick"
+            android:text="Get DB Backup"
+            android:textColor="#FF5733" />
+    </TableRow>
+</TableLayout>
+
+
+

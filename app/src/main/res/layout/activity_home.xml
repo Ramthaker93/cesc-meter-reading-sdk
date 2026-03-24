@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="16dp">
+
+
+    <EditText
+        android:id="@+id/txtuser"
+        android:layout_width="346dp"
+        android:layout_height="wrap_content"
+        android:background="#87CEEB"
+        android:editable="false"
+        android:ems="10"
+        android:enabled="false"
+        android:inputType="textPersonName"
+        android:paddingTop="5dp"
+        android:text="Login : sandeep"
+        android:textColor="#FF5733"
+        android:textStyle="bold" />
+
+    <LinearLayout
+        android:layout_width="fill_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_horizontal"
+        android:orientation="horizontal">
+
+        <Button
+            android:id="@+id/btnsearch"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:background="#884EA0"
+            android:paddingBottom="5dp"
+            android:paddingLeft="16dp"
+            android:paddingRight="16dp"
+            android:paddingTop="15dp"
+            android:text="Read Meter"
+            android:onClick="onbtnsearch"
+            android:textColor="#e8e9e9"
+            android:textStyle="bold"/>
+
+
+
+        <Button
+            android:id="@+id/btnupload"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_alignBaseline="@+id/btndownload"
+            android:layout_alignBottom="@+id/btndownload"
+            android:layout_alignEnd="@+id/textview"
+            android:layout_marginTop="50dp"
+            android:width="120dp"
+            android:text="LnG"
+            android:onClick="onbtnUpload"
+            android:textColor="#FF5733" />
+
+
+        <Button
+            android:id="@+id/btnDLMS"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_alignBaseline="@+id/btndownload"
+            android:layout_alignBottom="@+id/btndownload"
+            android:layout_alignEnd="@+id/textview"
+            android:layout_marginTop="50dp"
+            android:width="120dp"
+            android:text="Secure DLMS"
+            android:onClick="onbtnDLMS"
+            android:textColor="#FF5733" />
+    </LinearLayout>
+
+
+
+    <TextView
+        android:id="@+id/textView1"
+        android:layout_width="match_parent"
+        android:layout_height="401dp"
+        android:layout_marginBottom="10dp"
+        android:scrollHorizontally="true"
+        android:maxLines="150"
+        android:scrollbars="vertical"
+        android:text=""
+        android:textColor="#86AD33"
+        android:textSize="14dp"
+        android:textStyle="bold" />
+
+
+    <EditText
+        android:id="@+id/txtRole"
+        android:layout_width="348dp"
+        android:layout_height="wrap_content"
+        android:background="#87CEEB"
+        android:editable="false"
+        android:ems="10"
+        android:enabled="false"
+        android:paddingTop="5dp"
+        android:text="Role : "
+        android:textColor="#FF5733"
+        android:textStyle="bold" />
+</LinearLayout>

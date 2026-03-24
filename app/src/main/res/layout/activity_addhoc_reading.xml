@@ -1,0 +1,163 @@
+<?xml version="1.0" encoding="utf-8"?>
+
+<TableLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/tableLayout1"
+    android:layout_width="fill_parent"
+    android:background="@color/common_google_signin_btn_text_dark_disabled"
+    android:layout_height="fill_parent"
+    android:stretchColumns="0,1">
+    <TableRow
+        android:id="@+id/tableRow0"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+
+        android:padding="1dip" >
+        <EditText
+            android:id="@+id/txtuser"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_span="2"
+            android:editable="false"
+            android:enabled="false"
+            android:textSize="25sp"
+            android:textStyle="bold"
+            android:textColor="#FF5733"
+            android:ems="10"
+            android:inputType="textPersonName"
+            android:paddingTop="1dp"
+            android:text="Login : sandeep" />
+    </TableRow>
+
+    <TableRow
+        android:id="@+id/tableRow12"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:padding="5dip" >
+
+        <Spinner
+            android:id="@+id/ddlMeterMake"
+            android:layout_column="0"
+            android:layout_width="122dp"
+            android:layout_height="wrap_content"
+            android:layout_alignParentStart="true"
+            android:layout_marginTop="2dp"
+            android:layout_span="1" />
+        <Spinner
+            android:id="@+id/ddldatatoberead"
+            android:layout_width="122dp"
+            android:layout_column="1"
+            android:layout_height="wrap_content"
+            android:layout_alignParentStart="true"
+            android:layout_marginTop="2dp"
+            android:layout_span="1" />
+    </TableRow>
+
+    <TableRow
+        android:id="@+id/tableRow226"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:padding="1dip"        >
+        <TextView
+            android:id="@+id/lbllsdays"
+            android:layout_width="wrap_content"
+            android:layout_column="0"
+            android:layout_height="wrap_content"
+            android:textStyle="bold"
+            android:visibility="gone"
+            android:text="Load Profile Days" />
+        <EditText
+            android:id="@+id/txtloadprofile"
+            android:layout_width="150dp"
+            android:layout_height="wrap_content"
+            android:layout_alignEnd="@+id/editText2"
+            android:layout_below="@+id/imageView"
+            android:layout_marginTop="2dp"
+            android:textSize="12sp"
+            android:focusable="true"
+            android:freezesText="false"
+            android:hint="35"
+            android:visibility="gone"
+            android:inputType="number"
+            android:textColor="#000000"
+            android:textColorHighlight="#ff7eff15"
+            android:textColorHint="#ffff25e6" />
+
+    </TableRow>
+    <TableRow
+        android:id="@+id/tableRow111"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:padding="3dip"
+        >
+
+        <TextView
+            android:id="@+id/Status"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="..."
+            android:textColor="#F00"
+            android:textStyle="bold"
+            android:visibility="visible"
+            android:layout_span="2"
+
+            />
+
+
+    </TableRow>
+
+
+
+    <TableRow
+        android:id="@+id/tableRow126"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:padding="5dip">
+
+        <Button
+            android:id="@+id/btnReadWithTheft"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:layout_span="2"
+            android:layout_weight="1"
+            android:onClick="onbtnReadWithTheftClicked"
+            android:paddingLeft="15dp"
+            android:background="@drawable/gradient"
+            android:paddingTop="10dp"
+            android:paddingRight="10dp"
+            android:paddingBottom="10dp"
+            android:text="Download Data"
+            android:textColor="#ffffff"
+            android:shadowColor="#2BB827"
+            android:shadowDx="0"
+            android:shadowDy="0"
+
+            android:textSize="20sp"></Button>
+    </TableRow>
+
+    <TableRow
+        android:id="@+id/tableRow16"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:padding="5dip"
+        >
+
+        <Button
+            android:id="@+id/btnReadWithoutTheft"
+            android:layout_width="289dp"
+            android:layout_height="63dp"
+            android:layout_span="2"
+            android:background="#3333ff"
+            android:visibility="invisible"
+            android:onClick="onbtnReadWithoutTheftClicked"
+            android:paddingBottom="10dp"
+            android:paddingLeft="15dp"
+            android:paddingRight="15dp"
+            android:paddingTop="10dp"
+            android:text="Load Driver"
+            android:textColor="#ffffff"
+            android:textSize="20sp"></Button>
+    </TableRow>
+
+
+
+</TableLayout>

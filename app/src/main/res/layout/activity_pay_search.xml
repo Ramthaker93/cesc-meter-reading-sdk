@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="fill_parent"
+    android:layout_height="fill_parent"
+    android:orientation="vertical" >
+    <EditText
+        android:id="@+id/txtuser"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="#87CEEB"
+        android:editable="false"
+        android:ems="10"
+        android:enabled="false"
+        android:textStyle="bold"
+        android:textColor="#FF5733"
+        android:inputType="textPersonName"
+        android:paddingTop="5dp"
+        android:text="Login : sandeep" />
+
+    <Spinner
+        android:id="@+id/ddfileter"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content" />
+
+    <EditText
+        android:id="@+id/txtfilter"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:ems="10"
+        android:inputType="textPersonName"
+        android:text="" />
+
+    <Button
+        android:id="@+id/btnSubmit"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+
+        android:text="Submit" />
+
+
+    <GridView xmlns:android="http://schemas.android.com/apk/res/android"
+        android:shape="rectangle"
+        android:id="@+id/grid_view"
+        android:layout_width="300dp"
+        android:layout_height="wrap_content"
+        android:layout_margin="15dp"
+        android:horizontalSpacing="5dp"
+        android:verticalSpacing="5dp"
+        android:columnWidth="75dp"
+        android:padding="2dp"
+
+        android:numColumns="1"
+        android:stretchMode="columnWidth"
+        >
+        <!--content will be generate programmatically-->
+    </GridView>
+</LinearLayout>

@@ -1,0 +1,138 @@
+<?xml version="1.0" encoding="utf-8"?>
+
+<TableLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/tableLayout1"
+    android:layout_width="fill_parent"
+    android:layout_height="fill_parent" >
+
+    <!-- 2 columns -->
+    <TableRow
+        android:id="@+id/tableRow0"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:padding="1dip" >
+
+        <EditText
+            android:id="@+id/txtuser"
+            android:layout_width="164dp"
+            android:layout_height="wrap_content"
+            android:layout_span="2"
+            android:background="#87CEEB"
+            android:editable="false"
+            android:ems="10"
+            android:enabled="false"
+            android:inputType="textPersonName"
+            android:paddingTop="1dp"
+            android:text="Login : sandeep"
+            android:textColor="#FF5733"
+            android:textStyle="bold" />
+    </TableRow>
+    <TableRow
+        android:id="@+id/tableRow3"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:padding="1dip" >
+
+        <TextView
+            android:id="@+id/lbtConsumerNo"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textStyle="bold"
+            android:text="Consumer No" />
+        <TextView
+            android:id="@+id/lbConsumerNo"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="" />
+    </TableRow>
+    <TableRow
+        android:id="@+id/tableRow4"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:padding="1dip" >
+
+        <TextView
+            android:id="@+id/lbtReceiptNo"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textStyle="bold"
+            android:text="Receipt No" />
+        <TextView
+            android:id="@+id/lbReceiptNo"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="" />
+    </TableRow>
+    <TableRow
+        android:id="@+id/tableRow5"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:padding="1dip" >
+
+        <TextView
+            android:id="@+id/lbtName"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textStyle="bold"
+            android:text="Name" />
+        <TextView
+            android:id="@+id/lbName"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="" />
+    </TableRow>
+
+    <TableRow
+        android:id="@+id/tableRow6"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:padding="1dip" >
+
+        <TextView
+            android:id="@+id/lbtAddress"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textStyle="bold"
+            android:text="Address" />
+        <TextView
+            android:id="@+id/lbAddress"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="" />
+
+
+    </TableRow>
+
+    <TableRow
+        android:id="@+id/tableRow7"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:padding="1dip" >
+
+        <TextView
+            android:id="@+id/lbtPayMode"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textStyle="bold"
+            android:text="Payment Mode" />
+        <TextView
+            android:id="@+id/lbPayMode"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="" />
+    </TableRow>
+    <TableRow
+        android:id="@+id/tableRow14"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:padding="2dip" >
+        <Button
+            android:id="@+id/btnPrint"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Print"
+            android:onClick="onbtnPrintClicked"
+            >
+        </Button>
+    </TableRow>
+</TableLayout>

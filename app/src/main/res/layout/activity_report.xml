@@ -1,0 +1,169 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="@color/common_google_signin_btn_text_dark_disabled"
+    android:padding="16dp">
+    <TableRow
+        android:id="@+id/tableRow0"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+
+        android:padding="1dip" >
+        <EditText
+            android:id="@+id/txtuser"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_span="2"
+            android:editable="false"
+            android:enabled="false"
+            android:textSize="25sp"
+            android:textStyle="bold"
+            android:textColor="#FF5733"
+            android:paddingBottom="35dp"
+            android:ems="10"
+            android:inputType="textPersonName"
+            android:paddingTop="1dp"
+            android:text="Login : sandeep" />
+    </TableRow>
+    <TableRow
+        android:id="@+id/tableRow1"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:paddingBottom="10dp"
+        android:padding="5dip" >
+
+        <Button
+            android:id="@+id/btnmroDownload"
+            android:layout_width="330dp"
+            android:layout_height="wrap_content"
+            android:background="#3333ff"
+            android:onClick="onbtnDownloadClicked"
+            android:paddingLeft="15dp"
+            android:paddingTop="15dp"
+            android:paddingRight="15dp"
+            android:paddingBottom="15dp"
+            android:text="MRO Download"
+            android:textColor="#ffffff"
+            android:textSize="20sp"></Button>
+    </TableRow>
+
+    <TableRow
+        android:id="@+id/tableRow2"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:padding="5dip" >
+
+        <Button
+            android:id="@+id/btnReadingTaken"
+            android:layout_width="330dp"
+            android:layout_height="wrap_content"
+            android:background="#3333ff"
+            android:paddingLeft="15dp"
+            android:paddingTop="10dp"
+            android:paddingRight="15dp"
+            android:paddingBottom="10dp"
+            android:text="Reading Taken"
+            android:textColor="#ffffff"
+            android:textSize="20sp"></Button>
+    </TableRow>
+    <TableRow
+        android:id="@+id/tableRow3"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:padding="5dip" >
+
+        <Button
+            android:id="@+id/btnPending"
+            android:layout_width="330dp"
+            android:layout_height="wrap_content"
+            android:paddingBottom="10dp"
+            android:paddingLeft="15dp"
+            android:textSize="20sp"
+            android:background="#3333ff"
+            android:paddingRight="15dp"
+            android:paddingTop="10dp"
+            android:text="Pending Reading"
+            android:textColor="#ffffff"></Button>
+    </TableRow>
+
+
+
+    <TableRow
+        android:id="@+id/tableRow6"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:padding="5dip" >
+
+        <Button
+            android:id="@+id/btnReadUploaded"
+            android:layout_width="330dp"
+            android:layout_height="wrap_content"
+            android:paddingBottom="10dp"
+            android:paddingLeft="15dp"
+            android:textSize="20sp"
+            android:background="#3333ff"
+            android:paddingRight="15dp"
+            android:paddingTop="10dp"
+            android:text="Reading Uploaded"
+            android:textColor="#ffffff"></Button>
+    </TableRow>
+    <TableRow
+        android:id="@+id/tableRow7"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:padding="5dip" >
+
+        <Button
+            android:id="@+id/btnReadNotUploaded"
+            android:layout_width="330dp"
+            android:layout_height="wrap_content"
+            android:paddingBottom="10dp"
+            android:paddingLeft="15dp"
+            android:textSize="20sp"
+            android:background="#3333ff"
+            android:paddingRight="15dp"
+            android:paddingTop="10dp"
+            android:text="Reading Not Uploaded"
+            android:textColor="#ffffff"></Button>
+    </TableRow>
+    <TableRow
+        android:id="@+id/tableRow4"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:padding="5dip" >
+
+        <Button
+            android:id="@+id/btnOPReading"
+            android:layout_width="330dp"
+            android:layout_height="wrap_content"
+            android:paddingBottom="10dp"
+            android:paddingLeft="15dp"
+            android:textSize="20sp"
+            android:background="#3333ff"
+            android:paddingRight="15dp"
+            android:paddingTop="10dp"
+            android:text="Optical Reading"
+            android:textColor="#ffffff"></Button>
+    </TableRow>
+    <TableRow
+        android:id="@+id/tableRow5"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:padding="5dip" >
+
+        <Button
+            android:id="@+id/btnMReading"
+            android:layout_width="330dp"
+            android:layout_height="wrap_content"
+            android:paddingBottom="10dp"
+            android:paddingLeft="15dp"
+            android:textSize="20sp"
+            android:background="#3333ff"
+            android:paddingRight="15dp"
+            android:paddingTop="10dp"
+            android:text="Manual Reading"
+            android:textColor="#ffffff"></Button>
+    </TableRow>
+</LinearLayout>

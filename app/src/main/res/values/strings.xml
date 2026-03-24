@@ -1,0 +1,50 @@
+<resources>
+    <string name="app_name">CescRaj Meter Reader</string>
+
+    <string name="dummy_button">Dummy Button</string>
+    <string name="dummy_content">DUMMY\nCONTENT</string>
+
+    <string-array name="actualRead">
+        <item>--Select Remarks--</item>
+        <item>Suspected Misuse of Supply</item>
+        <item>Tariff Misuse</item>
+        <item>REMOTE SEARCH FAILED (BLE/LPR)</item>
+        <item>BLUR DISPLAY</item>
+        <item>METER / BOX BROKEN</item>
+        <item>TERMINAL BURNT</item>
+        <item>METER SEAL MISSING</item>
+        <item>OUTPUT CABLE NOT CONNECTED</item>
+        <item>NEW METER</item>
+        <item>NAF</item>
+    </string-array>
+
+
+    <string-array name="mr_main">
+        <item>--Select MR Code--</item>
+        <item>MISUSE</item>
+        <item>METER ISSUE</item>
+        <item>DISPLAY ISSUE</item>
+    </string-array>
+
+    <!-- child values for MISUSE -->
+    <string-array name="mr_misuse_child">
+        <item>Illegal Connection</item>
+        <item>Meter Bypass</item>
+        <item>Hooking</item>
+    </string-array>
+
+    <!-- child values for METER ISSUE -->
+    <string-array name="mr_meter_child">
+        <item>Meter Broken</item>
+        <item>Terminal Burnt</item>
+        <item>Seal Missing</item>
+    </string-array>
+
+    <!-- child values for DISPLAY ISSUE -->
+    <string-array name="mr_display_child">
+        <item>Blur Display</item>
+        <item>No Display</item>
+    </string-array>
+
+
+</resources>

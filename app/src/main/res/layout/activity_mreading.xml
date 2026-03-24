@@ -1,0 +1,322 @@
+<?xml version="1.0" encoding="utf-8"?>
+
+
+    <TableLayout xmlns:android="http://schemas.android.com/apk/res/android"
+        android:id="@+id/tableLayout1"
+        android:layout_width="fill_parent"
+        android:background="@color/common_google_signin_btn_text_dark_disabled"
+        android:layout_height="fill_parent"
+       >
+        <TableRow
+            android:id="@+id/tableRow0"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:padding="1dip" >
+            <EditText
+                android:id="@+id/txtuser"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:paddingBottom="5dp"
+                android:layout_span="2"
+                android:editable="false"
+                android:enabled="false"
+                android:textSize="25sp"
+                android:textStyle="bold"
+                android:textColor="#FF5733"
+                android:ems="10"
+                android:inputType="textPersonName"
+                android:paddingTop="1dp"
+                android:text="Login : sandeep" />
+        </TableRow>
+        <TableRow
+            android:id="@+id/tableRow1"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:padding="2dip" >
+
+
+            <RadioButton
+                android:id="@+id/rbConsNo"
+                android:layout_width="fill_parent"
+                android:layout_height="wrap_content"
+                android:text="Consumer No"
+                android:layout_marginRight="10px"
+                android:textSize="12sp"
+                android:onClick="onRadioButtonClicked"/>/>
+
+            <RadioButton
+                android:id="@+id/rbMeterNo"
+                android:layout_width="fill_parent"
+                android:layout_height="wrap_content"
+                android:text="Meter No"
+                android:textSize="12sp"
+                android:onClick="onRadioButtonClicked"/>
+
+        </TableRow>
+        <TableRow
+            android:id="@+id/tableRow2"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:padding="2dip" >
+
+            <EditText
+                android:id="@+id/txtConsumerNo"
+                android:layout_width="150dp"
+                android:layout_height="wrap_content"
+                android:layout_alignEnd="@+id/editText2"
+                android:layout_below="@+id/imageView"
+                android:layout_marginTop="1dp"
+                android:focusable="true"
+                android:hint=""
+                android:textSize="10sp"
+                android:textColor="#000000"
+                android:textColorHighlight="#ff7eff15"
+                android:textColorHint="#ffff25e6" />
+
+            <Button
+                android:id="@+id/btnShow"
+                android:layout_width="wrap_content"
+                android:layout_height="40dp"
+                android:layout_alignBaseline="@+id/button2"
+                android:layout_alignBottom="@+id/button2"
+                android:layout_toStartOf="@+id/textview"
+                android:onClick="onShowButtonClicked"
+                android:text="Show"
+                android:textSize="12sp" />
+        </TableRow>
+        <TableRow
+            android:id="@+id/tableRow3"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:padding="2dip" >
+
+            <TextView
+                android:id="@+id/lbtConsumerNo"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textStyle="bold"
+                android:text="Consumer No" />
+            <TextView
+                android:id="@+id/lbConsumerNo"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="" />
+        </TableRow>
+
+        <TableRow
+            android:id="@+id/tableRow4"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:padding="3dip" >
+
+            <TextView
+                android:id="@+id/lbtMeterNo"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textStyle="bold"
+                android:text="Meter No" />
+            <TextView
+                android:id="@+id/lbMeterNo"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="" />
+
+
+        </TableRow>
+        <TableRow
+            android:id="@+id/tableRow5"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:padding="2dip" >
+
+            <TextView
+                android:id="@+id/lbtName"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textStyle="bold"
+                android:text="Name" />
+            <TextView
+                android:id="@+id/lbName"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="" />
+        </TableRow>
+
+        <TableRow
+            android:id="@+id/tableRow6"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:padding="2dip" >
+
+            <TextView
+                android:id="@+id/lbtAddress"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textStyle="bold"
+                android:text="Address" />
+            <TextView
+                android:id="@+id/lbAddress"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:singleLine="false"
+                android:text="" />
+        </TableRow>
+        <TableRow
+            android:id="@+id/tableRow7"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:padding="2dip" >
+
+            <TextView
+                android:id="@+id/lbtStreet"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textStyle="bold"
+                android:text="Street" />
+            <TextView
+                android:id="@+id/lbStreet"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="" />
+        </TableRow>
+        <TableRow
+            android:id="@+id/tableRow8"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:padding="2dip" >
+
+            <EditText
+                android:id="@+id/txtKWH"
+                android:layout_width="150dp"
+                android:layout_height="wrap_content"
+                android:layout_alignEnd="@+id/editText2"
+                android:layout_below="@+id/imageView"
+                android:layout_marginTop="2dp"
+                android:textSize="12sp"
+                android:focusable="true"
+                android:freezesText="false"
+                android:hint="KWH"
+                android:inputType="numberDecimal"
+                android:textColor="#000000"
+                android:textColorHighlight="#ff7eff15"
+                android:textColorHint="#ffff25e6" />
+            <EditText
+                android:id="@+id/txtKVARH"
+                android:layout_width="150dp"
+                android:layout_height="wrap_content"
+                android:layout_alignEnd="@+id/editText2"
+                android:layout_below="@+id/imageView"
+                android:layout_marginTop="2dp"
+                android:textSize="12sp"
+                android:focusable="true"
+                android:hint="KVARH"
+                android:inputType="numberDecimal"
+                android:textColor="#000000"
+                android:textColorHighlight="#ff7eff15"
+                android:textColorHint="#ffff25e6" />
+        </TableRow>
+        <TableRow
+            android:id="@+id/tableRow9"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:padding="2dip" >
+            <EditText
+                android:id="@+id/txtKVAH"
+                android:layout_width="150dp"
+                android:layout_height="wrap_content"
+                android:layout_alignEnd="@+id/editText2"
+                android:layout_below="@+id/imageView"
+                android:layout_marginTop="2dp"
+                android:textSize="12sp"
+                android:focusable="true"
+                android:hint="KVah"
+                android:inputType="numberDecimal"
+                android:textColor="#000000"
+                android:textColorHighlight="#ff7eff15"
+                android:textColorHint="#ffff25e6" />
+            <EditText
+                android:id="@+id/txtKVA"
+                android:layout_width="150dp"
+                android:layout_height="wrap_content"
+                android:layout_alignEnd="@+id/editText2"
+                android:layout_marginTop="2dp"
+                android:textSize="12sp"
+                android:focusable="true"
+                android:hint="KVA"
+                android:inputType="numberDecimal"
+                android:textColor="#000000"
+                android:textColorHighlight="#ff7eff15"
+                android:textColorHint="#ffff25e6" />
+        </TableRow>
+        <TableRow
+            android:id="@+id/tableRow10"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:padding="2dip" >
+            <Spinner
+                android:id="@+id/ddlMRNote"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_alignParentStart="true"
+                android:layout_span="2"
+                android:layout_marginTop="2dp" />
+        </TableRow>
+
+        <TableRow
+            android:id="@+id/tableRow10_1"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:padding="2dip"
+            android:visibility="gone">  <!-- Initially hidden -->
+            <Spinner
+                android:id="@+id/ddlSubMRNote"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_span="2"
+                android:layout_marginTop="2dp"
+                android:hint="Select Sub MR Code" />
+        </TableRow>
+
+        <TableRow
+            android:id="@+id/tableRow11"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:padding="3dip" >
+            <Button
+                android:id="@+id/button1"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="photo"
+                android:background="#6666ff"
+                android:onClick="onShowPhotoClicked"
+                >
+            </Button>
+
+            <ImageView
+                android:id="@+id/imageView1"
+                android:layout_width="180dp"
+                android:layout_height="40dp"
+                >
+            </ImageView>
+            <TextView android:id="@+id/hidden_Image"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="hidden value"
+                android:visibility="gone"/>
+        </TableRow>
+        <TableRow
+            android:id="@+id/tableRow12"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:padding="2dip" >
+            <Button
+                android:id="@+id/btnSave"
+                android:layout_width="wrap_content"
+                android:background="#6666ff"
+                android:layout_height="wrap_content"
+                android:text="Save"
+                android:onClick="onbtnSaveClicked"
+                >
+            </Button>
+        </TableRow>
+    </TableLayout>

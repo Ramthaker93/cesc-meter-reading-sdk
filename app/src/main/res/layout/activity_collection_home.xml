@@ -1,0 +1,142 @@
+<?xml version="1.0" encoding="utf-8"?>
+
+<TableLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/tableLayout1"
+    android:layout_width="fill_parent"
+    android:layout_height="fill_parent" >
+
+    <TableRow
+        android:id="@+id/tableRow0"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:padding="1dip" >
+        <EditText
+            android:id="@+id/txtuser"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="#87CEEB"
+            android:layout_span="2"
+            android:editable="false"
+            android:enabled="false"
+            android:textStyle="bold"
+            android:textColor="#FF5733"
+            android:ems="10"
+            android:inputType="textPersonName"
+            android:paddingTop="1dp"
+            android:text="Login : sandeep" />
+    </TableRow>
+    <TableRow
+        android:id="@+id/tableRow1"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:padding="5dip" >
+
+        <Button
+            android:id="@+id/btnPaymentSearch"
+            android:layout_width="356dp"
+            android:layout_height="wrap_content"
+            android:onClick="onbtnbtnPaymentSearch"
+            android:text="Search"
+            android:textColor="#FF5733"></Button>
+    </TableRow>
+
+    <TableRow
+        android:id="@+id/tableRow2"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:padding="5dip" >
+
+        <Button
+            android:id="@+id/btnPaymentCollect"
+            android:layout_width="356dp"
+            android:layout_height="wrap_content"
+            android:onClick="onbtnbtnPaymentCollect"
+            android:text="Collection"
+            android:textColor="#FF5733"></Button>
+    </TableRow>
+    <TableRow
+        android:id="@+id/tableRow3"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:padding="5dip" >
+
+        <Button
+            android:id="@+id/btnPaymentReport"
+            android:layout_width="356dp"
+            android:layout_height="wrap_content"
+            android:onClick="onbtnbtnPaymentReport"
+            android:text="Payment Summary"
+            android:textColor="#FF5733"></Button>
+    </TableRow>
+    <TableRow
+        android:id="@+id/tableRow4"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:padding="5dip" >
+
+        <Button
+            android:id="@+id/btnPaymentReportDet"
+            android:layout_width="356dp"
+            android:layout_height="wrap_content"
+            android:onClick="onbtnbtnPaymentReportdet"
+            android:text="Payment Detail"
+            android:textColor="#FF5733"></Button>
+    </TableRow>
+
+    <TableRow
+        android:id="@+id/tableRow5"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:padding="5dip" >
+
+        <Button
+            android:id="@+id/btnPayDownloaddata"
+            android:layout_width="356dp"
+            android:layout_height="wrap_content"
+            android:text="--"
+            android:textColor="#FF5733"></Button>
+    </TableRow>
+    <TableRow
+        android:id="@+id/tableRow6"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:padding="5dip" >
+
+        <Button
+            android:id="@+id/btnPaymentCollectR"
+            android:layout_width="356dp"
+            android:layout_height="wrap_content"
+            android:onClick="onClickbtnPaymentCollectR"
+            android:text="--"
+            android:textColor="#FF5733"></Button>
+    </TableRow>
+    <TableRow
+        android:id="@+id/tableRow7"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:padding="5dip" >
+
+        <Button
+            android:id="@+id/btnPaymentNotUploaded"
+            android:layout_width="356dp"
+            android:layout_height="wrap_content"
+            android:onClick="OnclickbtnPaymentNotUploaded"
+            android:text="--"
+            android:textColor="#FF5733"></Button>
+    </TableRow>
+
+    <TableRow
+        android:id="@+id/tableRow8"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:padding="5dip" >
+
+        <Button
+            android:id="@+id/btnPaymentUploaded"
+            android:layout_width="356dp"
+            android:layout_height="wrap_content"
+            android:onClick="OnclickbtnPaymentUploaded"
+            android:text="--"
+            android:textColor="#FF5733"></Button>
+    </TableRow>
+</TableLayout>
