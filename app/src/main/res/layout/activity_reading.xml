@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
-<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+
+<ScrollView
+    xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="#F0F4F8"
@@ -17,7 +19,7 @@
             android:layout_height="wrap_content"
             android:textSize="16sp"
             android:textStyle="bold"
-            android:text="v2.0-beta"
+            android:text="v9.0-beta"
             android:padding="8dp"
             android:textColor="#1565C0"
             />
@@ -190,9 +192,22 @@
             android:textSize="14sp"
             android:textStyle="bold"
             android:background="#FFFFFF"
-            android:layout_marginBottom="8dp"
+            android:layout_marginBottom="4dp"
             android:elevation="2dp"
             android:onClick="onBtnRefreshUsbClicked" />
+
+        <!-- TEST SDK BUTTON -->
+        <Button
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:text="OPEN SDK TEST SCREEN"
+            android:textColor="#FFFFFF"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:background="#4527A0"
+            android:layout_marginBottom="8dp"
+            android:elevation="2dp"
+            android:onClick="onBtnOpenSdkTestClicked" />
 
         <!-- DOWNLOAD + ABORT BUTTONS -->
         <LinearLayout

@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(adb logcat *)",
+      "PowerShell(adb *)"
+    ]
+  }
+}

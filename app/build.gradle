@@ -54,6 +54,10 @@ android {
         }
 
     }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_15
+        targetCompatibility JavaVersion.VERSION_15
+    }
 
 }
 
@@ -71,12 +75,7 @@ dependencies {
 
     implementation fileTree(include: ['*.jar'], dir: 'libs')
 
-    // USB Serial Communication (usb-serial-for-android library via JitPack)
-
-    // Provides UsbSerialDriver, UsbSerialPort, UsbSerialProber for proper serial port I/O
-
-    implementation 'com.github.mik3y:usb-serial-for-android:2.0.0'
-    implementation 'com.github.mik3y:usb-serial-for-android:3.7.0'
+    // USB Serial classes are provided by the :metersdk module (custom drivers, same package)
     // AndroidX (modern) libraries
 
     implementation 'androidx.appcompat:appcompat:1.6.1'
@@ -126,6 +125,9 @@ dependencies {
     implementation 'com.squareup.retrofit2:adapter-rxjava2:2.9.0'
 
     // USB: Using Android's built-in USB API (android.hardware.usb.*) - no external library needed
+
+    // MeterReadingSDK library (USB serial classes + DLMS SDK)
+    implementation project(':metersdk')
 
 }
 

@@ -46,6 +46,18 @@
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         tools:replace="android:appComponentFactory">
+        <activity
+            android:name=".TestSDKActivity"
+            android:exported="true"
+            android:label="SDK Test — Meter Reading"
+            android:configChanges="orientation|screenSize|keyboardHidden">
+        </activity>
+        <activity
+            android:name="com.npcl.com.vcpopdl.MeterReaderActivity"
+            android:exported="true"
+            android:label="Meter Reader"
+            android:configChanges="orientation|screenSize|keyboardHidden">
+        </activity>
         <activity android:name=".AddhocReading"></activity>
         <activity android:name=".Reading_Supervisor" />
         <activity android:name=".PaymentCommanReport" />

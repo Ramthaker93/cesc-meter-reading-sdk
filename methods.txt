@@ -1,0 +1,134 @@
+public String getDisplayName() { return displayName; }
+public String getPassword()    { return password; }
+public static MeterMake fromDisplayName(String name) {
+public String getDisplayName() { return displayName; }
+public String getFilePrefix()  { return filePrefix; }
+public static ReadingMode fromString(String s) {
+protected void onCreate(Bundle savedInstanceState) {
+protected void onDestroy() {
+public void onConfigurationChanged(android.content.res.Configuration newConfig) {
+private void checkUsbStatus() {
+public void onShowButtonClicked(View v) {
+private void lookupConsumer(String filter, boolean byConsumerNo) {
+private void populateConsumerFields(Cursor c) {
+private String safeGet(Cursor c, String col) {
+public void onRadioButtonClicked(View v) {
+public String GetLocation() {
+public void onbtnReadWithTheftClicked(View v) {
+public void onbtnManualReading(View v) {
+public void onBtnRefreshUsbClicked(View v) {
+public void onBtnAbortClicked(View v) {
+public void onBtnLpPlusClicked(View v) {
+public void onBtnLpMinusClicked(View v) {
+private boolean validateDataForRead() {
+private void startLogTimer(final String meterNo, final String modeName) {
+private void stopLogTimer() {
+private void addProgressLog(final String message, final boolean isError) {
+public void run() {
+private void clearProgressLog() {
+public void run() {
+private void setProgressValue(int progress) {
+public void run() {
+public void UpdateStatus(String Meterno, String Status) {
+public void UpdateStatusFileNme(String Meterno, String Status) {
+protected String doInBackground(String... params) {
+protected void onProgressUpdate(String... values) {
+protected void onPostExecute(String result) {
+protected void onPreExecute() {
+protected String doInBackground(String... params) {
+protected void onProgressUpdate(String... values) {
+protected void onPostExecute(String result) {
+protected void onPreExecute() {
+public void onShowPhotoClicked(View v) {
+protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+public void BindMeterMake() {
+public void BindddlMCBType() {
+public void BindddlMeterLocation() {
+public void BindDatatoBeRead() {
+public String GetRole(String VCPID) {
+public void loadDriver() {
+public static int toInt32_2(byte[] bytes, int index) {
+private String currentDateFormat() {
+private String currentDateFormat1() {
+private void doFakeWork() {
+private String buildValidationBitmap(String data) {
+private void showLastReadBanner() {
+private void showMeterReadingDialog(String meterNo, StringBuilder meterDataSb) {
+private void addSummaryRow(StringBuilder html, String label, String imp, String exp) {
+private void addRow(StringBuilder html, String label, String imp, String exp) {
+private String extractDlmsTimestamp(String dataUpper, String obisHex) {
+private double[] unitConversion(int unitCode) {
+private String parseDlmsRegisterWithUnit(String dataUpper,
+private String extractBillingByObis(String dataUpper,
+private String extractBillingFromAltObis(String dataUpper,
+private long extractInstantRaw(String dataUpper, String obisHex) {
+private long extractBillingRawLong(String dataUpper,
+private int computeBillingEnergyAdj(String dataUpper,
+private String patchProfileBuffer(String bufHex,
+private void patchAndReplaceBuffer(StringBuilder meterData, String dataUpper,
+private void appendMissingScalerLines(StringBuilder sb, String dataUpper,
+private void postProcessMeterData(StringBuilder meterData) {
+private int skipOneDlmsValue(String payload, int pos) {
+private String extractRtc(String dataUpper) {
+private boolean hasDlmsScalarObjects() {
+private boolean isSecureMeter() { return hasDlmsScalarObjects(); }
+public String MakeDataFile(String FileName, String Data) {
+private String sanitizeFilePart(String value) {
+private String buildDataFileName(String meterMake, String readMode, String meterNo) {
+public void validateMeterDataForXML(StringBuilder meterData, String readingMode) {
+public void logMeterDataSummary(StringBuilder meterData) {
+private int countOccurrences(String text, String pattern) {
+public void appendLog(String text) {
+public void flushLog() {
+private void startDiagLog(String meterMakeLabel, String modeLabel, int lpDays) {
+public StringBuilder ReadElswedy() {
+public StringBuilder ReadLnG() {
+private Bitmap getImageFileFromSDCard(String filename) {
+private boolean  storeCameraPhotoInSDCard(Bitmap bitmap, String currentDate){
+public void DeletePhoto(String FileName)
+public static byte[] intToByteArray(int a)
+public static byte[] hexStringToByteArray(String s) {
+public String Hex2Digit(byte a)
+private StringBuilder  GetParameterSelective(UsbSerialPort port,byte nClassID, String sOBISCode, byte nAttribID, int nWait, byte nTryCount, byte nTimeOut, boolean isDLM,  Date  dateStartDate, Date  dateEndDate, int intProfilePd)
+private StringBuilder GetParameter1(UsbSerialPort port,byte nClassID, String sOBISCode, byte nAttribID, int nWait, byte nTryCount, byte nTimeOut, boolean isDLM,  StringBuilder strbldDLMdata) {
+private StringBuilder GetParameter(UsbSerialPort port,byte nClassID, String sOBISCode, byte nAttribID, int nWait, byte nTryCount, byte nTimeOut, boolean isDLM,  StringBuilder strbldDLMdata) {
+private StringBuilder GetParameter_LS(UsbSerialPort port, byte nClassID, String sOBISCode,
+private void abortPendingBlockTransfer(UsbSerialPort port) {
+private int parsePktLen() {
+private long decodeBlockNum(int addrOff) {
+private boolean sendRR(UsbSerialPort port, int addrOff, byte nTimeOut, byte nTryCount) {
+public static String byteArrayToHex(byte[] a) {
+private int AARQ(UsbSerialPort port, byte bytAsslevel, String strPsd, int nWait, byte nTryCount, byte nTimeOut)
+private void FrameType()
+public void ClearBuffer()
+private void drainPort(UsbSerialPort port) {
+private boolean SendPkt(UsbSerialPort port, byte[] buffer, int length)
+private void DataReceive(UsbSerialPort port) { DataReceive(port, 20); }
+private void DataReceive(UsbSerialPort port, int nReadTimeout)
+private boolean receiveFrame(UsbSerialPort port, long deadlineMs) {
+private int fcs_cal(int fcs,  byte[] cp, int length)
+public boolean IntToBool(int Number)
+public  void Fcs_Tab()
+public boolean fcs( byte[] cp, int len, byte flag)
+private boolean performModeCWakeup(UsbSerialPort port) {
+private boolean SetNRM(UsbSerialPort port, int nWait, byte nTryCount, byte nTimeOut) {
+private void AddressInit()
+private static int[] dlmsDefaultScalerUnit(String obisHex) {
+public static String parseMeterNoFromDlms(String rawHex) {
+private static String parseVisibleStringHex(String hexPayload) {
+public static String hexToString(String hex) {
+public String GetDatefromString(String tmpdate, int index)
+private StringBuilder ReadBillingData(UsbSerialPort port)
+private StringBuilder ReadEventData(UsbSerialPort port) {
+private StringBuilder ReadScalarUnit(String WhichData, UsbSerialPort port)
+private String getCaptureObjectsForMake() {
+private String mergeLpPageHexList(java.util.List<String> pages) {
+private boolean hasLoadProfileRecords(String lpHex) {
+private int countLoadProfileRecords(String lpHex) {
+private boolean hasMeaningfulDlmsPayload(StringBuilder data) {
+private boolean isNullTimestamp(String tsHex) {
+private String extractPayloadFor(String dataUpper, String obisHex) {
+private StringBuilder ReadLoadSurveyData(UsbSerialPort port , int lsDays)
+private StringBuilder  ReadNamePlate(UsbSerialPort port)
+private StringBuilder ReadMidnightSnapshot(UsbSerialPort port, int lsDays)
+private StringBuilder ReadInstantData(UsbSerialPort port)

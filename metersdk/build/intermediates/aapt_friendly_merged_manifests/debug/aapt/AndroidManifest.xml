@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.npcl.com.vcpopdl.metersdk" >
+
+    <uses-sdk android:minSdkVersion="21" />
+    <!-- Permissions required by MeterReadingSDK -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+
+    <uses-feature
+        android:name="android.hardware.usb.host"
+        android:required="true" />
+
+    <application>
+        <activity
+            android:name="com.npcl.com.vcpopdl.metersdk.MeterReaderActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:exported="true"
+            android:label="Meter Reader" />
+    </application>
+
+</manifest>
