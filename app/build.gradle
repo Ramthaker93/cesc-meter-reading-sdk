@@ -6,7 +6,7 @@ android {
 
         NewKey {
 
-            def ksFile = file('C:\\Users\\msbisht\\debug.keystore')
+            def ksFile = new File('C:/Users/msbisht/debug.keystore')
             if (ksFile.exists()) {
                 storeFile ksFile
                 storePassword 'Npcl2024'
