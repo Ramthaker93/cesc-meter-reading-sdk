@@ -1,0 +1,6 @@
+jdk:
+  - openjdk17
+before_install:
+  - echo "sdk.dir=$ANDROID_HOME" > local.properties
+install:
+  - ./gradlew :metersdk:publishReleasePublicationToMavenLocal

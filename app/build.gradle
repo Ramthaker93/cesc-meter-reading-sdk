@@ -6,13 +6,13 @@ android {
 
         NewKey {
 
-            storeFile file('C:\\Users\\msbisht\\debug.keystore')
-
-            storePassword 'Npcl2024'
-
-            keyAlias 'Npcl2024'
-
-            keyPassword 'Npcl2024'
+            def ksFile = file('C:\\Users\\msbisht\\debug.keystore')
+            if (ksFile.exists()) {
+                storeFile ksFile
+                storePassword 'Npcl2024'
+                keyAlias 'Npcl2024'
+                keyPassword 'Npcl2024'
+            }
 
         }
 
