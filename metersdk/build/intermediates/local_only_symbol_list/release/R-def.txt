@@ -1,0 +1,21 @@
+R_DEF: Internal format may change without notice
+local
+id mr_badgeCard
+id mr_btnAbort
+id mr_btnClearLog
+id mr_btnDone
+id mr_btnRefreshUsb
+id mr_btnStart
+id mr_configCard
+id mr_progressBar
+id mr_resultCard
+id mr_scrollLog
+id mr_spinnerMeterMake
+id mr_spinnerReadMode
+id mr_tvBadge
+id mr_tvLog
+id mr_tvResult
+id mr_tvStatus
+id mr_tvUsbStatus
+id mr_tvVersion
+layout activity_meter_reader

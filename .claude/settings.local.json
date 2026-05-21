@@ -7,7 +7,10 @@
       "Bash(git commit -m ' *)",
       "Bash(git push *)",
       "WebFetch(domain:jitpack.io)",
-      "Bash(git ls-remote *)"
+      "Bash(git ls-remote *)",
+      "Read(//mnt/c/Users/950259/Downloads/OpticalReading_CescRaj \\(11\\) \\(1\\)/**)",
+      "Bash(./gradlew :metersdk:compileDebugJavaWithJavac)",
+      "Bash(.\\\\gradlew.bat :metersdk:compileDebugJavaWithJavac)"
     ]
   }
 }

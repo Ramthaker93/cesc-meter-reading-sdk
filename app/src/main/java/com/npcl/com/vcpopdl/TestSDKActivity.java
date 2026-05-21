@@ -27,7 +27,7 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * TestSDKActivity — minimal test harness for MeterReadingSDK.
+ * TestSDKActivity — minimal test harness for ReadingSDK.
  *
  * How to use:
  *   1. Connect USB optical cable to the Android device.
@@ -39,7 +39,7 @@ import java.util.Locale;
  */
 public class TestSDKActivity extends AppCompatActivity {
 
-    private MeterReadingSDK sdk;
+    private ReadingSDK sdk;
 
     private Spinner spinnerMake;
     private Spinner spinnerMode;
@@ -101,10 +101,10 @@ public class TestSDKActivity extends AppCompatActivity {
     }
 
     private void populateSpinners() {
-        // Meter Make spinner — values from SDK enum
+        // Meter Make spinner — values from ReadingSDK enum
         List<String> makes = new ArrayList<>();
-        for (MeterReadingSDK.MeterMake m : MeterReadingSDK.MeterMake.values())
-            makes.add(m.displayName);
+        for (ReadingSDK.MeterMake m : ReadingSDK.MeterMake.values())
+            makes.add(m.getDisplayName());
         ArrayAdapter<String> makeAdapter = new ArrayAdapter<>(this,
                 android.R.layout.simple_spinner_item, makes);
         makeAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
@@ -113,8 +113,8 @@ public class TestSDKActivity extends AppCompatActivity {
 
         // Reading Mode spinner
         List<String> modes = new ArrayList<>();
-        for (MeterReadingSDK.ReadingMode m : MeterReadingSDK.ReadingMode.values())
-            modes.add(m.displayName);
+        for (ReadingSDK.ReadingMode m : ReadingSDK.ReadingMode.values())
+            modes.add(m.getDisplayName());
         ArrayAdapter<String> modeAdapter = new ArrayAdapter<>(this,
                 android.R.layout.simple_spinner_item, modes);
         modeAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
@@ -156,31 +156,28 @@ public class TestSDKActivity extends AppCompatActivity {
         if (fileName.isEmpty()) fileName = "SDK_TEST";
 
         // Map spinner selection to enum
-        MeterReadingSDK.MeterMake meterMake =
-                MeterReadingSDK.MeterMake.SECURE; // default
-        for (MeterReadingSDK.MeterMake m : MeterReadingSDK.MeterMake.values()) {
-            if (m.displayName.equals(makeStr)) { meterMake = m; break; }
+        ReadingSDK.MeterMake meterMake = ReadingSDK.MeterMake.SECURE; // default
+        for (ReadingSDK.MeterMake m : ReadingSDK.MeterMake.values()) {
+            if (m.getDisplayName().equals(makeStr)) { meterMake = m; break; }
         }
-        MeterReadingSDK.ReadingMode readingMode =
-                MeterReadingSDK.ReadingMode.COMPLETE; // default
-        for (MeterReadingSDK.ReadingMode m : MeterReadingSDK.ReadingMode.values()) {
-            if (m.displayName.equals(modeStr)) { readingMode = m; break; }
+        ReadingSDK.ReadingMode readingMode = ReadingSDK.ReadingMode.COMPLETE; // default
+        for (ReadingSDK.ReadingMode m : ReadingSDK.ReadingMode.values()) {
+            if (m.getDisplayName().equals(modeStr)) { readingMode = m; break; }
         }
 
-        appendLog("=== TEST START: Make=" + meterMake.displayName
-                + " Mode=" + readingMode.displayName
+        appendLog("=== TEST START: Make=" + meterMake.getDisplayName()
+                + " Mode=" + readingMode.getDisplayName()
                 + " File=" + fileName + " ===", false);
 
         setBusy(true);
 
-        sdk = new MeterReadingSDK(this);
+        sdk = new ReadingSDK(this);
 
-        final MeterReadingSDK.MeterMake finalMake = meterMake;
-        final MeterReadingSDK.ReadingMode finalMode = readingMode;
+        final ReadingSDK.MeterMake finalMake = meterMake;
+        final ReadingSDK.ReadingMode finalMode = readingMode;
         final String finalFile = fileName;
 
-        sdk.startReading(finalMake, finalMode, finalFile, new MeterReadingSDK.ReadingCallback() {
-
+        sdk.startReading(finalMake, finalMode, finalFile, new ReadingSDK.ReadingCallback() {
             @Override
             public void onProgress(String message, int progressPercent) {
                 progressBar.setProgress(progressPercent);
@@ -190,7 +187,7 @@ public class TestSDKActivity extends AppCompatActivity {
             }
 
             @Override
-            public void onComplete(MeterReadingSDK.MeterReadingResult result) {
+            public void onComplete(ReadingSDK.MeterReadingResult result) {
                 setBusy(false);
                 progressBar.setProgress(100);
 

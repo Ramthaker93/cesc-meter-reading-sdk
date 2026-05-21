@@ -364,54 +364,97 @@ public class MeterReadingSDK {
 
                     case BILLING: {
                         byte sTO = bytTimOut; byte sTC = bytTryCnt;
-                        bytTimOut = 3; bytTryCnt = 1;
+                        bytTimOut = 4; bytTryCnt = 1;
                         fireProgress(callback, "Downloading Instantaneous data...", 45);
                         MeterData.append(ReadInstantData(port));
                         bytTimOut = 10; bytTryCnt = 3;
-                        fireProgress(callback, "Downloading Billing data...", 56);
+                        long tBm_bill = System.currentTimeMillis();
+                        fireProgress(callback, "Downloading Billing data... (15-30s)", 56);
                         StringBuilder billStr = ReadBillingData(port, readingMode);
+                        long tBm_billE = (System.currentTimeMillis()-tBm_bill)/1000;
                         bytTimOut = sTO; bytTryCnt = sTC;
-                        if (billStr.length() > 10) MeterData.append(billStr);
-                        fireProgress(callback, "Billing read OK", 80);
+                        if (billStr.length() > 10) {
+                            MeterData.append(billStr);
+                            fireProgress(callback, "✓ Billing done (" + tBm_billE + "s)", 80);
+                        } else {
+                            fireProgress(callback, "WARN: Billing empty — check meter (" + tBm_billE + "s)", 80);
+                        }
                         break;
                     }
 
                     case COMPLETE: {
-                        byte sTO = bytTimOut; byte sTC = bytTryCnt;
-                        bytTimOut = 3; bytTryCnt = 1;
+                        long sessionStartMs = System.currentTimeMillis();
+                        long sessionDeadlineMs = sessionStartMs + 540_000L; // 9-min cap
+                        byte fastTO = (byte)4; byte fastTC = (byte)1;
+                        byte billTO = (byte)10; byte billTC = (byte)3;
+                        byte origTO = bytTimOut; byte origTC = bytTryCnt;
+
+                        // Phase 1: Instantaneous
+                        bytTimOut = fastTO; bytTryCnt = fastTC;
                         fireProgress(callback, "Downloading Instantaneous data...", 30);
                         MeterData.append(ReadInstantData(port));
                         fireProgress(callback, "Instantaneous OK", 38);
 
-                        bytTimOut = 10; bytTryCnt = 3;
-                        drainPort(port);
-                        android.os.SystemClock.sleep(150);
-                        fireProgress(callback, "Downloading Billing data...", 40);
-                        StringBuilder billingData = ReadBillingData(port, readingMode);
-                        MeterData.append(billingData);
-                        fireProgress(callback, "Billing OK", 50);
+                        if (System.currentTimeMillis() < sessionDeadlineMs) {
+                            // Phase 2: Billing
+                            bytTimOut = billTO; bytTryCnt = billTC;
+                            drainPort(port);
+                            android.os.SystemClock.sleep(150);
+                            fireProgress(callback, "Downloading Billing data...", 40);
+                            StringBuilder billingData = ReadBillingData(port, readingMode);
+                            MeterData.append(billingData);
+                            if (billingData != null && billingData.length() > 0)
+                                fireProgress(callback, "Billing OK", 50);
+                            else fireProgress(callback, "WARN: Billing empty", 50);
 
-                        bytTimOut = 3; bytTryCnt = 1;
-                        fireProgress(callback, "Downloading Midnight Snapshot...", 52);
-                        MeterData.append(ReadMidnightSnapshot(port, 0));
-                        fireProgress(callback, "Midnight OK", 58);
+                            if (System.currentTimeMillis() < sessionDeadlineMs) {
+                                // Phase 3: Midnight Snapshot
+                                bytTimOut = fastTO; bytTryCnt = fastTC;
+                                fireProgress(callback, "Downloading Midnight Snapshot...", 52);
+                                MeterData.append(ReadMidnightSnapshot(port, 0));
+                                fireProgress(callback, "Midnight OK", 58);
 
-                        bytTimOut = 8; bytTryCnt = 2;
-                        long lpBudgetMs = 1440000L;
-                        lpDeadlineMs = System.currentTimeMillis() + lpBudgetMs;
-                        fireProgress(callback, "Downloading Load Profile... (up to 24 min)", 60);
-                        MeterData.append(ReadLoadSurveyData(port, 0));
-                        lpDeadlineMs = 0;
-                        fireProgress(callback, "Load Profile OK", 73);
-                        flushLog();
+                                // Phase 4: Load Profile — budget = remaining time minus 30s events buffer, cap 6 min
+                                long lpRemaining = sessionDeadlineMs - System.currentTimeMillis() - 30_000L;
+                                if (lpRemaining >= 60_000L) {
+                                    long lpBudgetMs = Math.min(lpRemaining, 360_000L);
+                                    bytTimOut = (byte)8; bytTryCnt = (byte)2;
+                                    lpDeadlineMs = System.currentTimeMillis() + lpBudgetMs;
+                                    fireProgress(callback, "Downloading Load Profile... (up to " + (lpBudgetMs/1000) + "s)", 60);
+                                    MeterData.append(ReadLoadSurveyData(port, 0));
+                                    lpDeadlineMs = 0;
+                                    fireProgress(callback, "Load Profile OK", 73);
+                                    flushLog();
+                                } else {
+                                    appendLog("SESSION_SKIP_LP: only " + (lpRemaining/1000) + "s remaining");
+                                    fireProgress(callback, "WARN: Insufficient time for Load Profile — skipping", 73);
+                                }
 
-                        bytTimOut = 3; bytTryCnt = 1;
-                        fireProgress(callback, "Downloading Events...", 74);
-                        MeterData.append(ReadEventData(port));
-                        fireProgress(callback, "Events OK", 79);
-
-                        bytTimOut = sTO; bytTryCnt = sTC;
-                        fireProgress(callback, "Complete read OK", 80);
+                                // Phase 5: Events — re-establish COSEM first.
+                                // After large LP block transfer the meter COSEM association is exhausted;
+                                // subsequent GetRequest returns empty frames. SNRM+AARQ reopens it.
+                                if (System.currentTimeMillis() < sessionDeadlineMs) {
+                                    appendLog("REASSOC_START — re-establishing COSEM before events");
+                                    try {
+                                        drainPort(port);
+                                        android.os.SystemClock.sleep(200);
+                                        boolean nrmOk2 = SetNRM(port, bytWait, (byte)2, bytTimOut);
+                                        if (nrmOk2) {
+                                            int aarqRes2 = AARQ(port, (byte)1, currentMeterMake.password, bytWait, (byte)2, bytTimOut);
+                                            appendLog("REASSOC_" + (aarqRes2 == 0 ? "OK" : "FAIL res=" + aarqRes2));
+                                        } else { appendLog("REASSOC_NRM_FAIL — events may be incomplete"); }
+                                    } catch (Exception reEx) { appendLog("REASSOC_EX: " + reEx.getMessage()); }
+                                    bytTimOut = fastTO; bytTryCnt = fastTC;
+                                    fireProgress(callback, "Downloading Events...", 74);
+                                    MeterData.append(ReadEventData(port));
+                                    fireProgress(callback, "Events OK", 79);
+                                }
+                            }
+                        }
+                        bytTimOut = origTO; bytTryCnt = origTC;
+                        long sessionElapsed = System.currentTimeMillis() - sessionStartMs;
+                        appendLog("SESSION_END elapsed=" + (sessionElapsed/1000) + "s limit=540s");
+                        fireProgress(callback, "Complete read OK (" + (sessionElapsed/1000) + "s)", 80);
                         break;
                     }
                 }
@@ -1163,14 +1206,11 @@ public class MeterReadingSDK {
                 } while (!f3&&(int)n65!=(int)nTryCount);
                 if (!f3) { lastGplsResult=2; break; }
                 if ((int)(0xff&nRcvPkt[aO+11])==196&&(int)(0xff&nRcvPkt[aO+12])==2) {
-                    num1=decodeBlockNum(aO); flag1=!IntToBool(nRcvPkt[aO+14]);
-                    int off2=aO+20;
-                    if((int)(0xff&nRcvPkt[off2])==130){for(int i=aO+31;i<pktLength-1;i++) strbldDLMdata.append(Hex2Digit(nRcvPkt[i]));}
-                    else if((int)(0xff&nRcvPkt[off2])==129){for(int i=aO+30;i<pktLength-1;i++) strbldDLMdata.append(Hex2Digit(nRcvPkt[i]));}
-                    else{for(int i=aO+29;i<pktLength-1;i++) strbldDLMdata.append(Hex2Digit(nRcvPkt[i]));}
-                } else {
-                    for(int i=aO+18;i<pktLength-1;i++) strbldDLMdata.append(Hex2Digit(nRcvPkt[i]));
+                    num1=decodeBlockNum(aO); flag1=!IntToBool(0xff&nRcvPkt[aO+14]);
                 }
+                if ((int)(0xff&nRcvPkt[aO+20])==130){for(int i=aO+23;i<pktLength-1;i++) strbldDLMdata.append(Hex2Digit(nRcvPkt[i]));}
+                else if((int)(0xff&nRcvPkt[aO+20])==129){for(int i=aO+22;i<pktLength-1;i++) strbldDLMdata.append(Hex2Digit(nRcvPkt[i]));}
+                else{for(int i=aO+21;i<pktLength-1;i++) strbldDLMdata.append(Hex2Digit(nRcvPkt[i]));}
                 // nested HDLC segment inside flag1
                 while(((int)(0xff&nRcvPkt[1])&168)==168){
                     nPkt[2]=(byte)((int)bytAddMode+7);
@@ -1459,14 +1499,13 @@ public class MeterReadingSDK {
         }
 
         // ── 3. Integration period (OBIS 1.0.0.8.4.255 = 0100000804FF) ──────
-        // Provides the LP capture period in seconds. Parsing sets intProfilePd
-        // so GetParameterSelective can align from/to timestamps to interval boundaries.
+        // Parsed to set intProfilePd — NOT written to output (matches Reading.java).
         // NOTE: LP capture_period from 0100630100FF attr=4 is NOT read here (BUG-19 fix
         // in Reading.java: reading it here caused stale value before the LP phase).
         l = new StringBuilder();
         d = GetParameter(port,(byte)1,"0100000804FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l);
         if (hasMeaningfulDlmsPayload(d)) {
-            sb.append(d);
+            // Do NOT append to sb — Reading.java only parses this for intProfilePd, doesn't write it
             try {
                 String rawPd = d.toString().trim();
                 String pdHex = rawPd.length() >= 4 ? rawPd.substring(rawPd.length()-4) : rawPd;
@@ -1481,74 +1520,56 @@ public class MeterReadingSDK {
         d = GetParameter(port,(byte)8,"0000010000FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l);
         if (hasMeaningfulDlmsPayload(d)) sb.append(d);
 
-        // ── 5. Standard IS 15959-2 nameplate OBIS set ─────────────────────
-        // Matches the sequence in Reading.java ReadNamePlate.
-        String[][] np = {
-            {"1","0000600100FF","2"}, // Meter serial number
-            {"1","0100000200FF","2"}, // Firmware version
-            {"1","0000000100FF","2"}, // Meter identifier
-            {"1","0100000800FF","2"}, // Meter rating
-            {"1","0000600101FF","2"}, // Manufacturer name
-            {"1","0000600102FF","2"}, {"1","0000600103FF","2"},
-            {"1","0000600104FF","2"}, // Year of manufacture
-            {"1","0000600105FF","2"}, {"1","0000600106FF","2"},
-            {"1","0000600107FF","2"}, {"1","0000600108FF","2"},
-            {"1","0000600109FF","2"}, {"1","000060010AFF","2"},
-            {"1","000060010BFF","2"}, {"1","000060010CFF","2"},
-            {"1","000060010DFF","2"}, {"1","000060010EFF","2"},
-            {"1","000060010FFF","2"}, {"1","0000600110FF","2"},
-            {"1","0000600200FF","2"}, {"1","0000600300FF","2"},
-            {"1","0000600800FF","2"}, {"1","0000600400FF","2"},
-            {"1","0100000402FF","2"}, // CT ratio numerator
-            {"1","0100000403FF","2"}, // PT ratio numerator
-            {"1","0000000102FF","2"}, // Billing period last reset timestamp
-            {"1","0100608012FF","2"}, // Make-specific (Secure)
-            {"63","0000600A01FF","2"},// Activity calendar
-            {"1","0100608017FF","2"}, // Make-specific (Secure)
-            {"3","0100800800FF","3"}, {"3","0100800800FF","2"}, // Meter constant (Genus)
-            {"3","01005E5B01FF","2"}, {"3","01005E5B02FF","2"},
-            {"3","01005E5B08FF","2"}, {"3","01005E5B09FF","2"},
-            {"3","01005E5B0AFF","2"}, {"3","01005E5B0BFF","2"},
-            {"3","01005E5B0CFF","2"},
-            // Tamper duration counters (Genus LC)
-            {"3","0000600885FF","3"}, {"3","0000600885FF","2"},
-            {"3","0000600886FF","2"}, {"3","0000600887FF","2"},
-            // L&T extended nameplate registers 0.0.96.11.x.255
-            {"1","0000600B01FF","2"}, {"1","0000600B02FF","2"}, {"1","0000600B03FF","2"},
-            {"1","0000600B04FF","2"}, {"1","0000600B05FF","2"},
-            // Firmware/software version string (all makes)
-            {"1","0000600700FF","2"},
-            // Electronic serial number (all makes)
-            {"1","0000600200FF","2"},
-            // Special Days table (class 16, attr=4) — all makes
-            {"16","00000F0000FF","4"},
-            // HPL-specific nameplate
-            {"1","010080800EFF","2"}, {"1","010080800FFF","2"}, {"1","010080058CFF","2"},
-            // HPL meter status word and configuration register
-            {"1","0100600500FF","2"},
-            {"3","0100800880FF","3"}, {"3","0100800880FF","2"},
-            // HPL status/diagnostic registers (tamper flags, CT/PT diagnostics)
-            {"1","0100800580FF","2"}, {"1","0100800581FF","2"}, {"1","0100800582FF","2"},
-            {"1","0100800583FF","2"}, {"1","0100800584FF","2"}, {"1","0100800585FF","2"},
-            {"1","0100800587FF","2"}, {"1","0100800597FF","2"},
-            // Genus optical interface type
-            {"1","0000601410FF","2"}
-        };
-        for (String[] e : np) {
-            if (abortRequested) break;
-            l = new StringBuilder();
-            d = GetParameter(port, Byte.parseByte(e[0]), e[1],
-                    Byte.parseByte(e[2]), bytWait, (byte)1, bytTimOut, true, l);
-            if (hasMeaningfulDlmsPayload(d)) sb.append(d);
-        }
-
-        // TOU configuration (Secure only)
+        // ── 5. Nameplate OBIS — exact sequence from Reading.java ReadNamePlate ───
+        // Meter serial, firmware version, meter identifier, meter rating
+        l=new StringBuilder(); d=GetParameter(port,(byte)1,"0000600100FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)1,"0100000200FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // TOU configuration (Secure only) — placed here to match Reading.java's ReadNamePlate order
         if (isSecureMeter()) {
-            l = new StringBuilder();
-            d = GetParameter(port,(byte)1,"00005E5B09FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l);
-            if (hasMeaningfulDlmsPayload(d)) sb.append(d);
+            l=new StringBuilder(); d=GetParameter(port,(byte)1,"00005E5B09FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
         }
-
+        l=new StringBuilder(); d=GetParameter(port,(byte)1,"0000000100FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)1,"0100000800FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // Manufacturer name, year of manufacture
+        l=new StringBuilder(); d=GetParameter(port,(byte)1,"0000600101FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)1,"0000600104FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // CT/PT ratio, billing period reset timestamp
+        l=new StringBuilder(); d=GetParameter(port,(byte)1,"0100000402FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)1,"0100000403FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)1,"0000000102FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // Make-specific (single attempt each — not in all association lists)
+        l=new StringBuilder(); d=GetParameter(port,(byte)1,"0100608012FF",(byte)2,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)63,"0000600A01FF",(byte)2,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)1,"0100608017FF",(byte)2,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // Meter constant (Genus LC)
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100800800FF",(byte)3,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100800800FF",(byte)2,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // Tamper duration counters (Genus LC)
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0000600885FF",(byte)3,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0000600885FF",(byte)2,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0000600886FF",(byte)2,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0000600887FF",(byte)2,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // L&T extended nameplate registers 0.0.96.11.x.255 (single attempt each)
+        for (String nb : new String[]{"0000600B01FF","0000600B02FF","0000600B03FF","0000600B04FF","0000600B05FF"}) {
+            l=new StringBuilder(); d=GetParameter(port,(byte)1,nb,(byte)2,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        }
+        // Firmware/software version string and electronic serial number (all makes, bytTryCnt)
+        l=new StringBuilder(); d=GetParameter(port,(byte)1,"0000600700FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)1,"0000600200FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // Special Days table (class 16, attr=4) — all makes
+        l=new StringBuilder(); d=GetParameter(port,(byte)16,"00000F0000FF",(byte)4,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // HPL-specific nameplate and configuration registers (single attempt each)
+        for (String hplNp : new String[]{"010080800EFF","010080800FFF","010080058CFF"}) {
+            l=new StringBuilder(); d=GetParameter(port,(byte)1,hplNp,(byte)2,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        }
+        l=new StringBuilder(); d=GetParameter(port,(byte)1,"0100600500FF",(byte)2,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100800880FF",(byte)3,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100800880FF",(byte)2,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        for (String hplSt : new String[]{"0100800580FF","0100800581FF","0100800582FF","0100800583FF","0100800584FF","0100800585FF","0100800587FF","0100800597FF"}) {
+            l=new StringBuilder(); d=GetParameter(port,(byte)1,hplSt,(byte)2,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        }
+        // Genus optical interface type (single attempt)
+        l=new StringBuilder(); d=GetParameter(port,(byte)1,"0000601410FF",(byte)2,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
         return sb;
     }
 
@@ -1557,134 +1578,151 @@ public class MeterReadingSDK {
     // =========================================================================
 
     private StringBuilder ReadInstantData(UsbSerialPort port) {
-        StringBuilder sb = new StringBuilder();
-        StringBuilder d = ReadScalarUnit("INSTANT", port);
+        StringBuilder sb = new StringBuilder(); StringBuilder d; StringBuilder l;
+        d = ReadScalarUnit("INSTANT", port);
         if (hasMeaningfulDlmsPayload(d)) sb.append(d);
         if (isSecureMeter()) {
-            StringBuilder l = new StringBuilder();
-            d = GetParameter(port, (byte) 7, "01005E5B00FF", (byte) 3, bytWait, bytTryCnt, bytTimOut, true, l);
-            if (hasMeaningfulDlmsPayload(d)) sb.append(d);
-            l = new StringBuilder();
-            d = GetParameter(port, (byte) 7, "01005E5B00FF", (byte) 2, bytWait, bytTryCnt, bytTimOut, true, l);
-            if (hasMeaningfulDlmsPayload(d)) sb.append(d);
+            l=new StringBuilder(); d=GetParameter(port,(byte)7,"01005E5B00FF",(byte)3,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+            l=new StringBuilder(); d=GetParameter(port,(byte)7,"01005E5B00FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
         }
-        boolean isSecure  = (currentMeterMake == MeterMake.SECURE);
-        boolean isGenus   = (currentMeterMake == MeterMake.GENUS || currentMeterMake == MeterMake.AVON);
-        boolean isHPL     = (currentMeterMake == MeterMake.HPL);
-        boolean isLNT     = (currentMeterMake == MeterMake.LNT);
-        boolean ni = !isSecure; // need individual scaler reads for non-Secure makes
-
-        // Common instantaneous OBIS — current, voltage, power, PF, energy import
-        // {classId, obis, readAttr5ForTimestamp}
-        Object[][] io = {
-            {3,"01001F0700FF",false},{3,"0100330700FF",false},{3,"0100470700FF",false},  // I L1/L2/L3
-            {3,"0100200700FF",false},{3,"0100340700FF",false},{3,"0100480700FF",false},  // U L1/L2/L3
-            {3,"0100210700FF",false},{3,"0100350700FF",false},{3,"0100490700FF",false},  // PF L1/L2/L3
-            {3,"0100010700FF",false},{3,"0100020700FF",false},{3,"0100030700FF",false},
-            {3,"0100040700FF",false},{3,"0100090700FF",false},{3,"01000A0700FF",false},
-            {3,"01000D0700FF",false},{3,"01000E0700FF",false},
-            {3,"0100010800FF",false},                                                   // kWh Import
-            {3,"0100090800FF",false},                                                   // kVAh Import
-            {3,"0100050800FF",false},{3,"0100060800FF",false},
-            {3,"0100070800FF",false},{3,"0100080800FF",false},
-            {4,"0100010600FF",true},{4,"0100090600FF",true},                            // MD kW/kVA import
-            {4,"0100090601FF",true},{4,"0100010601FF",true}
-        };
-        for (Object[] e : io) {
-            if (abortRequested) break;
-            byte cId = (byte)(int)(Integer)e[0]; String ob = (String)e[1]; boolean a5 = (Boolean)e[2];
-            StringBuilder l = new StringBuilder();
-            if (ni) { d = GetParameter(port,cId,ob,(byte)3,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d); }
-            l = new StringBuilder();
-            d = GetParameter(port,cId,ob,(byte)2,bytWait,bytTryCnt,bytTimOut,true,l);
-            if (hasMeaningfulDlmsPayload(d)) sb.append(d);
-            if (a5) {
-                l = new StringBuilder();
-                d = GetParameter(port,cId,ob,(byte)5,bytWait,bytTryCnt,bytTimOut,true,l);
-                if (hasMeaningfulDlmsPayload(d)) sb.append(d);
-            }
-        }
-
-        // Export probe: read kWh export first; skip all export OBIS on import-only meters
+        boolean isSecure = (currentMeterMake == MeterMake.SECURE);
+        boolean isGenus  = (currentMeterMake == MeterMake.GENUS || currentMeterMake == MeterMake.AVON);
+        boolean isHPL    = (currentMeterMake == MeterMake.HPL);
+        boolean isLNT    = (currentMeterMake == MeterMake.LNT);
+        boolean needIndivScalers = !isSecure;
+        // Current L1 — attr=3 skipped for Secure (compound object provides all scalers)
+        if (needIndivScalers) { l=new StringBuilder(); d=GetParameter(port,(byte)3,"01001F0700FF",(byte)3,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d); }
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"01001F0700FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // Current L2
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100330700FF",(byte)3,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100330700FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // Current L3
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100470700FF",(byte)3,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100470700FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // Voltage L1
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100200700FF",(byte)3,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100200700FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // Voltage L2
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100340700FF",(byte)3,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100340700FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // Voltage L3
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100480700FF",(byte)3,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100480700FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // PF L1
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100210700FF",(byte)3,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100210700FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // PF L2
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100350700FF",(byte)3,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100350700FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // PF L3
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100490700FF",(byte)3,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100490700FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // Active power import
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100010700FF",(byte)3,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100010700FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // Reactive power import
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100030700FF",(byte)3,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100030700FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // Apparent power
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100090700FF",(byte)3,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100090700FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // Frequency
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"01000E0700FF",(byte)3,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"01000E0700FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // PF total
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"01000D0700FF",(byte)3,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"01000D0700FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // kWh import
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100010800FF",(byte)3,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100010800FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // Export probe — read kWh export first; skip all export OBIS on import-only meters
         boolean exportSupported = false;
-        {
-            StringBuilder l = new StringBuilder();
-            d = GetParameter(port,(byte)3,"0100020800FF",(byte)3,bytWait,bytTryCnt,bytTimOut,true,l);
-            if (hasMeaningfulDlmsPayload(d)) sb.append(d);
-            l = new StringBuilder();
-            d = GetParameter(port,(byte)3,"0100020800FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l);
-            if (hasMeaningfulDlmsPayload(d)) {
-                sb.append(d);
-                exportSupported = true;
-                appendLog("EXPORT_PROBE: kWh_exp present — reading all export OBIS");
-            } else {
-                appendLog("EXPORT_PROBE: kWh_exp empty — import-only meter, skipping export OBIS");
-            }
-        }
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100020800FF",(byte)3,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100020800FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l);
+        if (hasMeaningfulDlmsPayload(d)) { sb.append(d); exportSupported=true; appendLog("EXPORT_PROBE: kWh_exp present — reading all export OBIS"); }
+        else { appendLog("EXPORT_PROBE: kWh_exp empty — import-only meter, skipping export OBIS"); }
+        // kVAh import
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100090800FF",(byte)3,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100090800FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // kVArh Q1 lag
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100050800FF",(byte)3,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100050800FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // kVArh Q4 lead
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100080800FF",(byte)3,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100080800FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // kVAh export
         if (exportSupported) {
-            // kVAh export
-            { StringBuilder l=new StringBuilder(); d=GetParameter(port,(byte)3,"01000A0800FF",(byte)3,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d); }
-            { StringBuilder l=new StringBuilder(); d=GetParameter(port,(byte)3,"01000A0800FF",(byte)2,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d); }
-            // MD kW export
-            { StringBuilder l=new StringBuilder(); d=GetParameter(port,(byte)4,"0100020600FF",(byte)3,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d); }
-            { StringBuilder l=new StringBuilder(); d=GetParameter(port,(byte)4,"0100020600FF",(byte)2,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d); }
-            { StringBuilder l=new StringBuilder(); d=GetParameter(port,(byte)4,"0100020600FF",(byte)5,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d); }
-            // MD kVA export
-            { StringBuilder l=new StringBuilder(); d=GetParameter(port,(byte)4,"01000A0600FF",(byte)3,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d); }
-            { StringBuilder l=new StringBuilder(); d=GetParameter(port,(byte)4,"01000A0600FF",(byte)2,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d); }
-            { StringBuilder l=new StringBuilder(); d=GetParameter(port,(byte)4,"01000A0600FF",(byte)5,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d); }
+            l=new StringBuilder(); d=GetParameter(port,(byte)3,"01000A0800FF",(byte)3,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+            l=new StringBuilder(); d=GetParameter(port,(byte)3,"01000A0800FF",(byte)2,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
         }
-
-        // Genus-specific OBIS
+        // MD kW import
+        l=new StringBuilder(); d=GetParameter(port,(byte)4,"0100010600FF",(byte)3,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)4,"0100010600FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)4,"0100010600FF",(byte)5,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // MD kVA import
+        l=new StringBuilder(); d=GetParameter(port,(byte)4,"0100090600FF",(byte)3,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)4,"0100090600FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)4,"0100090600FF",(byte)5,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // MD kW + kVA export
+        if (exportSupported) {
+            l=new StringBuilder(); d=GetParameter(port,(byte)4,"0100020600FF",(byte)3,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+            l=new StringBuilder(); d=GetParameter(port,(byte)4,"0100020600FF",(byte)2,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+            l=new StringBuilder(); d=GetParameter(port,(byte)4,"0100020600FF",(byte)5,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+            l=new StringBuilder(); d=GetParameter(port,(byte)4,"01000A0600FF",(byte)3,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+            l=new StringBuilder(); d=GetParameter(port,(byte)4,"01000A0600FF",(byte)2,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+            l=new StringBuilder(); d=GetParameter(port,(byte)4,"01000A0600FF",(byte)5,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        }
+        // Genus MD kW/kVA export (Genus-specific OBIS)
         if (isGenus) {
-            // MD kW/kVA export (Genus-specific)
-            for (String[] e2 : new String[][]{
-                    {"4","0100B20600FF","3"},{"4","0100B20600FF","2"},{"4","0100B20600FF","5"},
-                    {"4","0100B30600FF","3"},{"4","0100B30600FF","2"},{"4","0100B30600FF","5"},
-                    {"3","0100090200FF","3"},{"3","0100090200FF","2"},  // kVAh .2. group
-                    {"3","0100010200FF","3"},{"3","0100010200FF","2"}   // kWh .2. group
-            }) {
-                if (abortRequested) break;
-                StringBuilder l=new StringBuilder();
-                d=GetParameter(port,Byte.parseByte(e2[0]),e2[1],Byte.parseByte(e2[2]),bytWait,(byte)1,bytTimOut,true,l);
-                if (hasMeaningfulDlmsPayload(d)) sb.append(d);
-            }
-            // Voltage/current harmonics (.7C. group)
-            for (String hob : new String[]{"010020077CFF","010034077CFF","010048077CFF","01001F077CFF","010033077CFF","010047077CFF"}) {
-                if (abortRequested) break;
-                StringBuilder l=new StringBuilder(); d=GetParameter(port,(byte)3,hob,(byte)3,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
-                l=new StringBuilder(); d=GetParameter(port,(byte)3,hob,(byte)2,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
-            }
+            l=new StringBuilder(); d=GetParameter(port,(byte)4,"0100B20600FF",(byte)3,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+            l=new StringBuilder(); d=GetParameter(port,(byte)4,"0100B20600FF",(byte)2,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+            l=new StringBuilder(); d=GetParameter(port,(byte)4,"0100B20600FF",(byte)5,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+            l=new StringBuilder(); d=GetParameter(port,(byte)4,"0100B30600FF",(byte)3,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+            l=new StringBuilder(); d=GetParameter(port,(byte)4,"0100B30600FF",(byte)2,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+            l=new StringBuilder(); d=GetParameter(port,(byte)4,"0100B30600FF",(byte)5,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
         }
-
-        // L&T per-phase active power (confirmed MRI 25165449 NTD 3-phase)
+        // L&T per-phase active power
         if (isLNT) {
             for (String ob2 : new String[]{"0100240700FF","0100380700FF","01004C0700FF"}) {
                 if (abortRequested) break;
-                StringBuilder l=new StringBuilder(); d=GetParameter(port,(byte)3,ob2,(byte)3,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+                l=new StringBuilder(); d=GetParameter(port,(byte)3,ob2,(byte)3,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
                 l=new StringBuilder(); d=GetParameter(port,(byte)3,ob2,(byte)2,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
             }
         }
-
-        // HPL phasor angles (confirmed DDT KT341729)
+        // Genus kVAh .2. group
+        if (isGenus) {
+            l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100090200FF",(byte)3,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+            l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100090200FF",(byte)2,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        }
+        // HPL phasor angles
         if (isHPL) {
             for (String ob2 : new String[]{"0100510701FF","0100510702FF","0100510704FF","0100510705FF","0100510706FF"}) {
                 if (abortRequested) break;
-                StringBuilder l=new StringBuilder(); d=GetParameter(port,(byte)3,ob2,(byte)3,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+                l=new StringBuilder(); d=GetParameter(port,(byte)3,ob2,(byte)3,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
                 l=new StringBuilder(); d=GetParameter(port,(byte)3,ob2,(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
             }
-            // HPL phasor/power-quality snapshot profiles (DDT KT341729)
+        }
+        // Manufacturer ID
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0000600800FF",(byte)3,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)3,"0000600800FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // HPL phasor/power-quality snapshot profiles
+        if (isHPL) {
             for (String ob2 : new String[]{"0100638100FF","0100638000FF","0100638200FF","0100638300FF"}) {
                 if (abortRequested) break;
-                StringBuilder l=new StringBuilder(); d=GetParameter(port,(byte)7,ob2,(byte)3,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+                l=new StringBuilder(); d=GetParameter(port,(byte)7,ob2,(byte)3,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
                 l=new StringBuilder(); d=GetParameter(port,(byte)7,ob2,(byte)2,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
             }
         }
-
-        // Manufacturer ID and RTC
-        { StringBuilder l=new StringBuilder(); d=GetParameter(port,(byte)3,"0000600800FF",(byte)3,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d); }
-        { StringBuilder l=new StringBuilder(); d=GetParameter(port,(byte)3,"0000600800FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d); }
-        { StringBuilder l=new StringBuilder(); d=GetParameter(port,(byte)8,"0000010000FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d); }
+        // Genus harmonics (.7C. group) + kWh .2.
+        if (isGenus) {
+            for (String hob : new String[]{"010020077CFF","010034077CFF","010048077CFF","01001F077CFF","010033077CFF","010047077CFF"}) {
+                if (abortRequested) break;
+                l=new StringBuilder(); d=GetParameter(port,(byte)3,hob,(byte)3,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+                l=new StringBuilder(); d=GetParameter(port,(byte)3,hob,(byte)2,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+            }
+            l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100010200FF",(byte)3,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+            l=new StringBuilder(); d=GetParameter(port,(byte)3,"0100010200FF",(byte)2,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        }
         return sb;
     }
 
@@ -1701,19 +1739,19 @@ public class MeterReadingSDK {
 
     private StringBuilder ReadBillingData(UsbSerialPort port, ReadingMode rm) {
         StringBuilder sb = new StringBuilder(); StringBuilder d; StringBuilder l;
+        boolean billingBufferFailed = false;
+        // STEP 1: Current RTC — must be first so parser knows read timestamp
         l=new StringBuilder(); d=GetParameter(port,(byte)8,"0000010000FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // STEP 2: Scalar/unit descriptor for billing type
         d=ReadScalarUnit("BILLTYPC",port); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
-
-        // Read billing-specific scalers (BSCL prefix) so downstream parser uses
-        // billing scalers instead of instantaneous scalers when they differ (e.g. HPL).
+        // STEP 2b: Per-register billing scalers (BSCL prefix)
         String[] bo = {
             "0100010800FF","0100020800FF","0100090800FF","01000A0800FF",
             "0100050800FF","0100060800FF","0100070800FF","0100080800FF",
             "0100010600FF","0100090600FF","0100090601FF","0100010601FF",
             "01000A0600FF","0100020600FF",
-            "0100B20600FF","0100B30600FF"   // Genus-specific export MD
+            "0100B20600FF","0100B30600FF"
         };
-        // TOD kWh import T1-T8, export T1-T4, kVAh import T1-T8
         for (int t=1; t<=8; t++) bo = appendToArray(bo, String.format("010001080%XFF", t));
         for (int t=1; t<=4; t++) bo = appendToArray(bo, String.format("010002080%XFF", t));
         for (int t=1; t<=8; t++) bo = appendToArray(bo, String.format("010009080%XFF", t));
@@ -1721,18 +1759,70 @@ public class MeterReadingSDK {
             if (abortRequested) break;
             StringBuilder scalerSb = new StringBuilder();
             d = GetParameter(port,(byte)3,ob,(byte)3,bytWait,(byte)1,bytTimOut,false,scalerSb);
-            if (hasMeaningfulDlmsPayload(d)) {
-                sb.append("\r\nBSCL ").append(ob).append(" ").append(d.toString().trim());
-                appendLog("BILL_SCALER_READ obis=" + ob);
-            }
+            if (hasMeaningfulDlmsPayload(d)) { sb.append("\r\nBSCL ").append(ob).append(" ").append(d.toString().trim()); appendLog("BILL_SCALER_READ obis=" + ob); }
         }
-
-        l=new StringBuilder(); d=GetParameter(port,(byte)7,"0100620100FF",(byte)3,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
-        // Use GetParameter1 for billing buffer (attr=2) — multi-block DLMS transfer required
-        l=new StringBuilder(); d=GetParameter1(port,(byte)7,"0100620100FF",(byte)2,bytWait,bytTryCnt,(byte)10,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // STEP 3: Billing profile capture_objects (attr=3)
+        l=new StringBuilder(); d=GetParameter(port,(byte)7,"0100620100FF",(byte)3,bytWait,bytTryCnt,bytTimOut,true,l);
+        if (hasMeaningfulDlmsPayload(d)) sb.append(d); else billingBufferFailed = true;
+        // STEP 4: Billing profile buffer (attr=2) — BILLING mode uses selective access (2 records only)
+        boolean usedSelectiveAccess = false;
+        if (rm == ReadingMode.BILLING) {
+            try {
+                java.util.Calendar now = java.util.Calendar.getInstance();
+                int yyyy=now.get(java.util.Calendar.YEAR); int mm=now.get(java.util.Calendar.MONTH)+1;
+                int dd2=now.get(java.util.Calendar.DAY_OF_MONTH); int hh=now.get(java.util.Calendar.HOUR_OF_DAY);
+                int min=now.get(java.util.Calendar.MINUTE); int ss2=now.get(java.util.Calendar.SECOND);
+                byte[] fromDt = new byte[]{(byte)(yyyy>>8),(byte)(yyyy&0xFF),(byte)mm,0x01,(byte)0xFF,0x00,0x00,0x00,(byte)0xFF,(byte)0x80,0x00,(byte)0xFF};
+                byte[] toDt   = new byte[]{(byte)(yyyy>>8),(byte)(yyyy&0xFF),(byte)mm,(byte)dd2,(byte)0xFF,(byte)hh,(byte)min,(byte)ss2,0x00,(byte)0x80,0x00,(byte)0xFF};
+                StringBuilder dest = new StringBuilder();
+                d = GetParameterWithRangeAccess(port,(byte)7,"0100620100FF",fromDt,toDt,(byte)bytWait,bytTryCnt,bytTimOut,true,dest);
+                if (hasMeaningfulDlmsPayload(d)) {
+                    sb.append(d); usedSelectiveAccess = true;
+                    appendLog("BILLING_SELECTIVE: 2-date read succeeded (" + String.format("%02d/%02d/%04d", 1, mm, yyyy) + " to " + String.format("%02d/%02d/%04d %02d:%02d:%02d", dd2, mm, yyyy, hh, min, ss2) + ")");
+                }
+            } catch (Exception selEx) { appendLog("BILLING_SELECTIVE_FAIL: " + selEx.getMessage() + " — falling back to full buffer"); }
+        }
+        if (!usedSelectiveAccess) {
+            l=new StringBuilder(); d=GetParameter1(port,(byte)7,"0100620100FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,l);
+            if (hasMeaningfulDlmsPayload(d)) sb.append(d);
+            else { billingBufferFailed = true; appendLog("BILLING_WARN: Buffer (attr=2) failed — CO and EIU preserved"); }
+        }
+        // STEP 5: Billing profile entries_in_use (attr=7)
         l=new StringBuilder(); d=GetParameter(port,(byte)7,"0100620100FF",(byte)7,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
-        l=new StringBuilder(); d=GetParameter(port,(byte)20,"0000600A0100FF",(byte)2,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // STEP 6: ActivityCalendar (Class 20, OBIS 0.0.13.0.0.255) — tariff schedule
+        for (byte attr : new byte[]{2,3,4,5}) { l=new StringBuilder(); d=GetParameter(port,(byte)20,"00000D0000FF",attr,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d); }
+        l=new StringBuilder(); d=GetParameter(port,(byte)20,"00000D0000FF",(byte)7,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)20,"00000D0000FF",(byte)9,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        l=new StringBuilder(); d=GetParameter(port,(byte)1,"00000D0080FF",(byte)2,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        if (billingBufferFailed) { appendLog("BILLING_WARN: Billing buffer missing — partial billing section retained (CO+EIU present)"); sb.append("\r\nBILLING_BUFFER_FAILED=1"); }
         return sb;
+    }
+
+    private StringBuilder GetParameterWithRangeAccess(UsbSerialPort port, byte classId, String obis,
+            byte[] fromDt, byte[] toDt, byte wait, byte tryCnt, byte timeout, boolean append, StringBuilder dest) {
+        try {
+            byte[] clockObisBytes = new byte[]{0x00,0x00,0x01,0x00,0x00,(byte)0xFF};
+            byte[] selectData = new byte[]{
+                0x01, 0x02,0x04, 0x02,0x04, 0x12,0x00,0x08, 0x09,0x06,
+                clockObisBytes[0],clockObisBytes[1],clockObisBytes[2],clockObisBytes[3],clockObisBytes[4],clockObisBytes[5],
+                0x11,0x02, 0x12,0x00,0x00, 0x09,0x0C,
+                fromDt[0],fromDt[1],fromDt[2],fromDt[3],fromDt[4],fromDt[5],fromDt[6],fromDt[7],fromDt[8],fromDt[9],fromDt[10],fromDt[11],
+                0x09,0x0C,
+                toDt[0],toDt[1],toDt[2],toDt[3],toDt[4],toDt[5],toDt[6],toDt[7],toDt[8],toDt[9],toDt[10],toDt[11],
+                0x01,0x00
+            };
+            return GetParameter1WithSelectiveAccess(port, classId, obis, (byte)2, selectData, wait, tryCnt, timeout, append, dest);
+        } catch (Exception ex) {
+            appendLog("RANGE_ACCESS_BUILD_FAIL: " + ex.getMessage());
+            return GetParameter1(port, classId, obis, (byte)2, wait, tryCnt, timeout, append, dest);
+        }
+    }
+
+    private StringBuilder GetParameter1WithSelectiveAccess(UsbSerialPort port,
+            byte classId, String obis, byte attrId, byte[] selectData,
+            byte wait, byte tryCnt, byte timeout, boolean append, StringBuilder dest) {
+        appendLog("SELECTIVE_ACCESS: falling back to full buffer (APDU encoding pending)");
+        return GetParameter1(port, classId, obis, attrId, wait, tryCnt, timeout, append, dest);
     }
 
     // =========================================================================
@@ -1740,118 +1830,556 @@ public class MeterReadingSDK {
     // =========================================================================
 
     private StringBuilder ReadMidnightSnapshot(UsbSerialPort port, int ls) {
-        StringBuilder sb = new StringBuilder();
-        // Daily Load Profile scalar (01005E5B05FF) — Secure only, fast-fail on others
-        StringBuilder dscalar = ReadScalarUnit("DAILYLOAD", port);
-        if (hasMeaningfulDlmsPayload(dscalar)) sb.append(dscalar);
-        // Daily Load Profile (1.0.99.2.0.255 = 0100630200FF) — IS 15959-2 standard OBIS
-        for (String[] e : new String[][]{{"7","0100630200FF","3"},{"7","0100630200FF","7"},{"7","0100630200FF","2"}}) {
-            if (abortRequested) break;
-            StringBuilder l=new StringBuilder(); StringBuilder d=GetParameter(port,Byte.parseByte(e[0]),e[1],Byte.parseByte(e[2]),bytWait,bytTryCnt,bytTimOut,true,l);
-            if (hasMeaningfulDlmsPayload(d)) sb.append(d);
+        StringBuilder sb = new StringBuilder(); StringBuilder d; StringBuilder l;
+        // Daily snapshot scalar/unit (01005E5B05FF) — Secure only, fast-fail on others
+        d = ReadScalarUnit("DAILYLOAD", port);
+        if (hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // attr=3: capture_objects — column definitions
+        l=new StringBuilder(); d=GetParameter(port,(byte)7,"0100630200FF",(byte)3,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // attr=4: capture_period in seconds — needed for selective access alignment
+        l=new StringBuilder(); d=GetParameter(port,(byte)7,"0100630200FF",(byte)4,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
+        // attr=7: entries_in_use — cross-check with buffer result
+        l=new StringBuilder(); d=GetParameter(port,(byte)7,"0100630200FF",(byte)7,bytWait,bytTryCnt,bytTimOut,true,l);
+        int midnightEiu = -1;
+        if (hasMeaningfulDlmsPayload(d)) {
+            sb.append(d);
+            try {
+                String[] ep = d.toString().trim().split("\\s+");
+                if (ep.length >= 4 && ep[3].length() >= 10)
+                    midnightEiu = (int) Long.parseLong(ep[3].substring(2, 10), 16);
+                appendLog("MIDNIGHT_EIU=" + midnightEiu);
+            } catch (Exception ignored) {}
         }
+        // attr=2: buffer — selective access for last snapDays days
+        int snapDays = (ls > 0) ? ls : 35;
+        StringBuilder bufD = null;
+        try {
+            java.util.Calendar calEnd = java.util.Calendar.getInstance();
+            calEnd.set(java.util.Calendar.HOUR_OF_DAY, 23); calEnd.set(java.util.Calendar.MINUTE, 59); calEnd.set(java.util.Calendar.SECOND, 59);
+            java.util.Calendar calStart = java.util.Calendar.getInstance();
+            calStart.add(java.util.Calendar.DAY_OF_YEAR, -snapDays);
+            calStart.set(java.util.Calendar.HOUR_OF_DAY, 0); calStart.set(java.util.Calendar.MINUTE, 0); calStart.set(java.util.Calendar.SECOND, 0);
+            appendLog("MIDNIGHT_SEL days=" + snapDays);
+            l=new StringBuilder();
+            bufD = GetParameterSelective(port,(byte)7,"0100630200FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,calStart.getTime(),calEnd.getTime(),1440,l);
+        } catch (Exception e2) {
+            appendLog("MIDNIGHT_SEL_EX: " + e2.getMessage() + " — falling back to full buffer");
+        }
+        if (hasMeaningfulDlmsPayload(bufD)) { sb.append(bufD); }
+        else {
+            appendLog("MIDNIGHT_SEL_EMPTY — retrying with full buffer read");
+            StringBuilder fbSb = new StringBuilder();
+            bufD = GetParameter_LS(port,(byte)7,"0100630200FF",(byte)2,bytWait,bytTryCnt,bytTimOut,true,fbSb);
+            if (hasMeaningfulDlmsPayload(bufD)) sb.append(bufD);
+        }
+        // Cross-check EIU vs buffer
+        if (midnightEiu == 0) appendLog("MIDNIGHT_INFO: entries_in_use=0 — buffer confirmed empty");
+        else if (midnightEiu > 0 && !hasMeaningfulDlmsPayload(bufD)) appendLog("MIDNIGHT_CRITICAL: entries_in_use=" + midnightEiu + " but buffer empty — read failure");
+        if (sb.length() == 0) appendLog("MIDNIGHT_WARN: Midnight snapshot all responses empty — skipping section.");
         return sb;
     }
 
     private StringBuilder ReadEventData(UsbSerialPort port) {
-        StringBuilder sb = new StringBuilder();
-        StringBuilder dscalar = ReadScalarUnit("EVENT", port);
-        if (hasMeaningfulDlmsPayload(dscalar)) sb.append(dscalar);
+        StringBuilder strbldDLMdata = new StringBuilder(); StringBuilder DLMdata;
+        DLMdata = ReadScalarUnit("EVENT", port);
+        if (hasMeaningfulDlmsPayload(DLMdata)) strbldDLMdata.append(DLMdata);
 
         String[] eventObis = {
-            // IS 15959-2 standard event profiles (class 7)
-            "0000636200FF",  // Voltage event log
-            "0000636201FF",  // Current event log
-            "0000636202FF",  // Power fail event log
-            "0000636203FF",  // Transaction event log
-            "0000636204FF",  // Other event log
-            "0000636205FF",  // Non-rollover / control event log
-            "0000636206FF",  // Power quality event log
-            // HPL tamper / security event logs
-            "0000636233FF","0000636234FF","0000636235FF",
-            "0000636236FF","0000636237FF","0000636238FF","0000636239FF",
-            // Genus LC extended event logs (DLM MRI 20103429 / 05103456)
+            "0000636200FF","0000636201FF","0000636202FF","0000636203FF","0000636204FF",
+            "0000636205FF","0000636206FF",
+            "0000636233FF","0000636234FF","0000636235FF","0000636236FF","0000636237FF","0000636238FF","0000636239FF",
             "0000636281FF","0000636285FF","0000636286FF","0000636288FF",
-            "000063628FFF","0000636290FF","0000636291FF","0000636292FF",
-            "0000636293FF","0000636294FF","0000636295FF",
-            // L&T (Schneider ER300P) 00005E5Bxx event profiles (MRI 25165449 + KT228194)
-            "00005E5B08FF","00005E5B09FF","00005E5B0AFF","00005E5B0BFF",
-            "00005E5B0CFF","00005E5B0DFF","00005E5B0EFF"
+            "000063628FFF","0000636290FF","0000636291FF","0000636292FF","0000636293FF","0000636294FF","0000636295FF",
+            "00005E5B08FF","00005E5B09FF","00005E5B0AFF","00005E5B0BFF","00005E5B0CFF","00005E5B0DFF","00005E5B0EFF"
         };
-        boolean eventCoMissing = false;
-        boolean eventCoProbed  = false;
+        boolean eventCoMissing = false; boolean eventCoProbed = false;
+
         for (String obis : eventObis) {
-            if (abortRequested) { appendLog("EVENT_LOOP_ABORT"); break; }
+            if (abortRequested) { appendLog("EVENT_LOOP_ABORT — abortRequested=true, skipping remaining event OBIS"); break; }
+            // attr=3: capture objects
             StringBuilder l = new StringBuilder();
-            StringBuilder dco = GetParameter(port,(byte)7,obis,(byte)3,bytWait,bytTryCnt,bytTimOut,true,l);
-            if (!hasMeaningfulDlmsPayload(dco)) {
+            DLMdata = GetParameter(port,(byte)7,obis,(byte)3,bytWait,bytTryCnt,bytTimOut,true,l);
+            if (!hasMeaningfulDlmsPayload(DLMdata)) {
                 if (!eventCoMissing && !eventCoProbed) {
-                    // Probe attr=2 to check if data exists despite empty CO
                     eventCoProbed = true;
-                    StringBuilder l2 = new StringBuilder();
-                    StringBuilder d2 = GetParameter(port,(byte)7,obis,(byte)2,bytWait,bytTryCnt,bytTimOut,true,l2);
-                    if (hasMeaningfulDlmsPayload(d2)) {
-                        eventCoMissing = true;
-                        sb.append(d2);
-                        appendLog("EVENT_CO_MISSING — reading attr=2 directly for remaining OBIS");
-                    } else {
-                        appendLog("EVENT_SKIP CO+attr2 both empty obis=" + obis);
-                    }
-                } else if (eventCoMissing) {
-                    // CO empty but we know data may exist — read attr=2 directly
-                    l = new StringBuilder();
-                    StringBuilder d2 = GetParameter(port,(byte)7,obis,(byte)2,bytWait,bytTryCnt,bytTimOut,true,l);
-                    if (hasMeaningfulDlmsPayload(d2)) sb.append(d2);
+                    appendLog("EVENT_CO_PROBE obis=" + obis + " — attr=3 empty, probing attr=2 directly");
+                    StringBuilder probeSb = new StringBuilder();
+                    StringBuilder probeDat = GetParameter(port,(byte)7,obis,(byte)2,bytWait,(byte)1,bytTimOut,false,probeSb);
+                    if (hasMeaningfulDlmsPayload(probeDat)) {
+                        String probeHex = probeDat.toString().trim().split("\\s+").length > 3 ? probeDat.toString().trim().split("\\s+")[3] : "";
+                        if (probeHex.length() >= 4 && probeHex.startsWith("01") && Integer.parseInt(probeHex.substring(2,4),16) > 0) {
+                            eventCoMissing = true; strbldDLMdata.append(probeDat);
+                            appendLog("EVENT_CO_PROBE_HAS_DATA obis=" + obis + " — EIU/CO firmware bug, reading all events without CO check");
+                            continue;
+                        } else { appendLog("EVENT_CO_PROBE_EMPTY obis=" + obis + " — events not supported"); }
+                    } else { appendLog("EVENT_CO_PROBE_NO_RESPONSE obis=" + obis + " — events not supported"); }
                 }
-                continue;
+                if (!eventCoMissing) { appendLog("EVENT_SKIP obis=" + obis + " attr=3 absent — not supported on this meter"); continue; }
+            } else { strbldDLMdata.append(DLMdata); }
+
+            // attr=7: entries_in_use
+            l = new StringBuilder();
+            DLMdata = GetParameter(port,(byte)7,obis,(byte)7,bytWait,(byte)1,bytTimOut,true,l);
+            int eiu = -1;
+            if (hasMeaningfulDlmsPayload(DLMdata)) {
+                strbldDLMdata.append(DLMdata);
+                try { String[] ep = DLMdata.toString().trim().split("\\s+"); if (ep.length >= 4 && ep[3].length() >= 10) eiu = (int)Long.parseLong(ep[3].substring(2,10),16); } catch (Exception ignored) {}
+                appendLog("EVENT_EIU obis=" + obis + " entries=" + eiu);
             }
-            sb.append(dco);
-            l = new StringBuilder(); StringBuilder dui = GetParameter(port,(byte)7,obis,(byte)7,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(dui)) sb.append(dui);
-            l = new StringBuilder(); StringBuilder dbuf = GetParameter(port,(byte)7,obis,(byte)2,bytWait,bytTryCnt,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(dbuf)) sb.append(dbuf);
+
+            // Session recovery if DM frame after attr=7
+            if (lastGplsResult == 2) {
+                appendLog("EVENT_DM_BEFORE_ATTR2 obis=" + obis + " — re-establishing session");
+                try {
+                    AddressInit(); boolean nrmOk = SetNRM(port, bytWait, (byte)2, bytTimOut);
+                    if (nrmOk) { int aarqRes = AARQ(port,(byte)1,currentMeterMake.password,bytWait,(byte)2,bytTimOut); if(aarqRes==0){drainPort(port);lastGplsResult=0;}else{appendLog("EVENT_DM_RECOVER_FAIL obis="+obis);continue;} }
+                    else { appendLog("EVENT_DM_RECOVER_NRM_FAIL obis=" + obis); continue; }
+                } catch (Exception evDmEx) { appendLog("EVENT_DM_RECOVER_EX " + evDmEx.getMessage()); continue; }
+            }
+            // Skip attr=2 when EIU=0
+            if (eiu == 0) { appendLog("EVENT_SKIP_ATTR2 obis=" + obis + " entries_in_use=0"); continue; }
+
+            // attr=2: buffer with per-event deadline
+            long eventReadBudgetMs = (long)bytTimOut * bytTryCnt * 2 * 1000L;
+            long eventDeadline = System.currentTimeMillis() + eventReadBudgetMs;
+            appendLog("EVENT_ATTR2_START obis=" + obis + " eiu=" + eiu + " budget=" + (eventReadBudgetMs/1000) + "s");
+            l = new StringBuilder();
+            DLMdata = GetParameter(port,(byte)7,obis,(byte)2,bytWait,bytTryCnt,bytTimOut,true,l);
+            if (hasMeaningfulDlmsPayload(DLMdata)) {
+                strbldDLMdata.append(DLMdata);
+                appendLog("EVENT_ATTR2_OK obis=" + obis + " elapsed=" + (System.currentTimeMillis()-eventDeadline+eventReadBudgetMs) + "ms");
+            } else if (eiu == 0) {
+                appendLog("EVENT_INFO obis=" + obis + " buffer empty — consistent with entries_in_use=0");
+            } else if (eiu > 0) {
+                appendLog("EVENT_WARN obis=" + obis + " buffer empty but entries_in_use=" + eiu + " — read failure");
+                if (lastGplsResult == 2) {
+                    appendLog("EVENT_ATTR2_DM obis=" + obis + " — session dropped, re-establishing");
+                    try {
+                        AddressInit(); boolean nrmOk = SetNRM(port, bytWait, (byte)2, bytTimOut);
+                        if (nrmOk) { int aarqRes = AARQ(port,(byte)1,currentMeterMake.password,bytWait,(byte)2,bytTimOut); if(aarqRes==0){drainPort(port);lastGplsResult=0;appendLog("EVENT_ATTR2_DM_RECOVER_OK obis="+obis);} }
+                    } catch (Exception evEx) { appendLog("EVENT_ATTR2_DM_EX " + evEx.getMessage()); }
+                }
+            } else { appendLog("EVENT_SKIP obis=" + obis + " attr=2 zero-or-empty"); }
         }
-        return sb;
+        if (strbldDLMdata.length() == 0) appendLog("EVENT_WARN: All event responses empty — meter may not support event logs");
+        return strbldDLMdata;
     }
 
     // =========================================================================
-    // ReadLoadSurveyData
+    // =========================================================================
+    // Helper functions for ReadLoadSurveyData (copied from Reading.java)
+    // =========================================================================
+
+    private boolean hasLoadProfileRecords(String lpHex) {
+        if (lpHex == null || lpHex.isEmpty()) return false;
+        if (lpHex.contains("0212090c")) return true;
+        if (lpHex.contains("0212090C")) return true;
+        int tsCount = 0; int idx = 0; String lowerHex = lpHex.toLowerCase();
+        while ((idx = lowerHex.indexOf("090c", idx)) >= 0) { tsCount++; idx += 4; if (tsCount >= 2) return true; }
+        return false;
+    }
+
+    private String mergeLpPageHexList(java.util.List<String> pages) {
+        if (pages == null || pages.isEmpty()) return null;
+        if (pages.size() == 1) return pages.get(0);
+        StringBuilder allRecords = new StringBuilder(); int totalCount = 0; int skippedPages = 0;
+        for (String page : pages) {
+            if (page == null || page.length() < 4) continue;
+            String lower = page.toLowerCase(); int dataStart = -1; int cnt = 0;
+            for (int skip = 0; skip <= 32; skip += 2) {
+                if (skip + 4 > lower.length()) break;
+                int tagByte; try { tagByte = Integer.parseInt(lower.substring(skip, skip + 2), 16); } catch (Exception e) { break; }
+                if (tagByte == 0x01) {
+                    int cbPos = skip + 2; if (cbPos + 2 > lower.length()) break;
+                    int countByte; try { countByte = Integer.parseInt(lower.substring(cbPos, cbPos + 2), 16); } catch (Exception e) { break; }
+                    if ((countByte & 0x80) == 0) { cnt = countByte; dataStart = cbPos + 2; }
+                    else { int nb = countByte & 0x7F; if (nb == 1 && cbPos + 4 <= lower.length()) { try { cnt = Integer.parseInt(lower.substring(cbPos + 2, cbPos + 4), 16); } catch (Exception e) { break; } dataStart = cbPos + 4; } else if (nb == 2 && cbPos + 6 <= lower.length()) { try { cnt = Integer.parseInt(lower.substring(cbPos + 2, cbPos + 6), 16); } catch (Exception e) { break; } dataStart = cbPos + 6; } }
+                    break;
+                }
+            }
+            if (dataStart < 0 || dataStart >= page.length()) {
+                int recStart = -1; int idx = 0;
+                while ((idx = lower.indexOf("090c", idx)) >= 0) { int candidate = idx - 4; if (candidate >= 0 && lower.charAt(candidate) == '0' && lower.charAt(candidate + 1) == '2') { recStart = candidate; break; } idx += 4; }
+                if (recStart >= 0 && recStart < page.length()) { int recCnt = countLoadProfileRecords(page); totalCount += recCnt; allRecords.append(page.substring(recStart)); } else { skippedPages++; }
+            } else if (dataStart + 2 <= lower.length() && lower.charAt(dataStart) == '0' && lower.charAt(dataStart + 1) == '2') {
+                totalCount += cnt; allRecords.append(page.substring(dataStart));
+            } else {
+                int recStart = -1; int idx = 0;
+                while ((idx = lower.indexOf("090c", idx)) >= 0) { int candidate = idx - 4; if (candidate >= 0 && lower.charAt(candidate) == '0' && lower.charAt(candidate + 1) == '2') { recStart = candidate; break; } idx += 4; }
+                if (recStart >= 0 && recStart < page.length()) { int recCnt = countLoadProfileRecords(page); totalCount += recCnt; allRecords.append(page.substring(recStart)); } else { skippedPages++; }
+            }
+        }
+        if (skippedPages > 0) appendLog("LP_MERGE_SKIPPED_PAGES=" + skippedPages);
+        String berCount;
+        if (totalCount < 0x80) berCount = String.format("%02X", totalCount);
+        else if (totalCount < 0x100) berCount = String.format("81%02X", totalCount);
+        else berCount = String.format("82%04X", totalCount);
+        return "01" + berCount + allRecords.toString();
+    }
+
+    private java.util.Date extractLastLpTimestamp(String lpHex, int capturePeriodMin) {
+        try {
+            String lowerHex = lpHex.toLowerCase(); int lastPos = -1; int idx = 0;
+            while (true) { int found = lowerHex.indexOf("090c07e", idx); if (found < 0) break; lastPos = found; idx = found + 1; }
+            if (lastPos < 0) return null;
+            String ts = lowerHex.substring(lastPos + 4, lastPos + 28); if (ts.length() < 24) return null;
+            int y  = Integer.parseInt(ts.substring(0, 4),  16); int mo = Integer.parseInt(ts.substring(4, 6),  16); if (mo > 127) mo = 1;
+            int d  = Integer.parseInt(ts.substring(6, 8),  16); if (d  > 127) d  = 1;
+            int h  = Integer.parseInt(ts.substring(10, 12),16); if (h  > 127) h  = 0;
+            int mi = Integer.parseInt(ts.substring(12, 14),16); if (mi > 127) mi = 0;
+            if (y < 2000 || y > 2100 || mo < 1 || mo > 12) return null;
+            java.util.Calendar cal = java.util.Calendar.getInstance();
+            cal.set(y, mo - 1, d, h, mi, 0); cal.set(java.util.Calendar.MILLISECOND, 0);
+            cal.add(java.util.Calendar.MINUTE, capturePeriodMin);
+            return cal.getTime();
+        } catch (Exception ignored) { return null; }
+    }
+
+    private void abortPendingBlockTransfer(UsbSerialPort port) {
+        lpDeadlineMs = 0;
+        try {
+            int addrOff = 0xff & bytAddMode;
+            nPkt[2] = (byte)(addrOff + 19);
+            nRetLSH = (byte)(0xff & ((int)nRecvCntr << 5)); nPkt[addrOff + 5] = (byte)((int)nRetLSH | 16);
+            nRetLSH = (byte)((int)nSentCntr << 1); nPkt[addrOff + 5] = (byte)((int)nRetLSH | (int)nPkt[addrOff + 5]);
+            int wp = addrOff + 8;
+            nPkt[wp++]=(byte)0xE6; nPkt[wp++]=(byte)0xE7; nPkt[wp++]=(byte)0x00;
+            nPkt[wp++]=(byte)0xC0; nPkt[wp++]=(byte)0x02; nPkt[wp++]=(byte)0x81; nPkt[wp++]=(byte)0x00; nPkt[wp++]=(byte)0x00;
+            nPkt[wp++]=(byte)0x00; nPkt[wp++]=(byte)0x00; nPkt[wp++]=(byte)0x00; nPkt[wp++]=(byte)0x00;
+            int abortEnd = wp;
+            fcs(nPkt, addrOff + 5, (byte) 1); fcs(nPkt, abortEnd - 1, (byte) 1); nPkt[abortEnd + 2] = (byte) 0x7E;
+            int abortLen = abortEnd + 3;
+            ClearBuffer(); byte[] cmd = new byte[abortLen]; for (int i = 0; i < abortLen; i++) cmd[i] = (byte)(nPkt[i] & 0xff);
+            SendPkt(port, cmd, abortLen);
+            try { Thread.sleep(50); } catch (InterruptedException ignored) {}
+            DataReceive(port); appendLog("ABORT_BLOCK_TRANSFER nCounter=" + nCounter); ClearBuffer();
+        } catch (Exception ex) { appendLog("ABORT_BLOCK_TRANSFER_EX: " + ex.getMessage()); }
+    }
+
+    private StringBuilder GetParameter_LS(UsbSerialPort port, byte nClassID, String sOBISCode,
+            byte nAttribID, int nWait, byte nTryCount, byte nTimeOut,
+            boolean isDLM, StringBuilder strbldDLMdata) {
+        StringBuilder SbData = new StringBuilder(); final int addrOff = 0xff & bytAddMode; lastGplsResult = 0;
+        try {
+            nPkt[2] = (byte)(addrOff + 25);
+            nRetLSH = (byte)(0xff & ((int)nRecvCntr << 5)); nPkt[addrOff + 5] = (byte)((int)nRetLSH | 16);
+            nRetLSH = (byte)((int)nSentCntr << 1); nPkt[addrOff + 5] = (byte)((int)nRetLSH | (int)nPkt[addrOff + 5]);
+            int wi = addrOff + 8;
+            nPkt[wi++]=(byte)0xE6; nPkt[wi++]=(byte)0xE7; nPkt[wi++]=(byte)0x00;
+            nPkt[wi++]=(byte)0xC0; nPkt[wi++]=(byte)0x01; nPkt[wi++]=(byte)0x81; nPkt[wi++]=(byte)0x00; nPkt[wi++]=(byte)(0xff & nClassID);
+            byte[] obisBytes = hexStringToByteArray(sOBISCode.substring(0, 12));
+            for (int i = 0; i < 6; i++) nPkt[wi++] = obisBytes[i];
+            nPkt[wi++] = nAttribID; nPkt[wi++] = (byte)0x00;
+            int payloadEnd = wi;
+            fcs(nPkt, addrOff + 5, (byte)1); fcs(nPkt, payloadEnd - 1, (byte)1); nPkt[payloadEnd + 2] = (byte)0x7E;
+            int sendLen = payloadEnd + 3;
+            if (isDLM) { String clsHex = Integer.toHexString(0xff & nClassID); if (clsHex.length()==1) strbldDLMdata.append("\r\n000").append(clsHex).append(" ").append(sOBISCode).append(" 0").append(nAttribID).append(" "); else strbldDLMdata.append("\r\n00").append(clsHex).append(" ").append(sOBISCode).append(" 0").append(nAttribID).append(" "); }
+            byte retries = 0; boolean gotResponse = false;
+            do {
+                drainPort(port); byte[] sendCmd = new byte[sendLen]; for (int i = 0; i < sendLen; i++) sendCmd[i] = (byte)(nPkt[i] & 0xff);
+                SendPkt(port, sendCmd, sendLen); long tStart = System.currentTimeMillis(); long attemptDeadline = tStart + ((int)nTimeOut * 1000L);
+                if (abortRequested || (lpDeadlineMs > 0 && System.currentTimeMillis() > lpDeadlineMs)) { appendLog("GPLS_ABORT OBIS=" + sOBISCode); SbData.append(strbldDLMdata); return SbData; }
+                ClearBuffer(); gotResponse = receiveFrame(port, attemptDeadline);
+                if (gotResponse) { retries = 0; FrameType(); } else { appendLog("GPLS_TIMEOUT OBIS=" + sOBISCode + " retry=" + retries); retries++; }
+            } while (!gotResponse && (int)retries < (int)nTryCount);
+            appendLog("GPLS OBIS=" + sOBISCode + " attr=" + nAttribID + " got=" + gotResponse + " nCounter=" + nCounter);
+            if (!gotResponse) { lastGplsResult = 2; SbData.append(strbldDLMdata); return SbData; }
+            if ((nRcvPkt[addrOff + 5] & 0xff) == 0x97 || ((nRcvPkt[addrOff + 5] & 0xff) & 1) == 1) { appendLog("GPLS_ERROR_FRAME OBIS=" + sOBISCode); lastGplsResult = 2; SbData.append(strbldDLMdata); return SbData; }
+            final int MAX_HDLC_FRAMES = 64; int hdlcFrameCount = 0;
+            while (((nRcvPkt[1] & 0xff) & 0xA8) == 0xA8 && hdlcFrameCount < MAX_HDLC_FRAMES) {
+                hdlcFrameCount++; appendLog("GPLS_HDLC_SEG frame=" + hdlcFrameCount);
+                if (!sendRR(port, addrOff, nTimeOut, nTryCount)) { appendLog("GPLS_HDLC_SEG_FAIL frame=" + hdlcFrameCount); break; }
+                for (int i = addrOff + 8; i < pktLength - 1; i++) strbldDLMdata.append(Hex2Digit(nRcvPkt[i]));
+            }
+            boolean moreDlmsBlocks = false; long dlmsBlockNum = 1;
+            if ((nRcvPkt[addrOff + 11] & 0xff) == 0xC4 && (nRcvPkt[addrOff + 12] & 0xff) == 0x02) {
+                boolean lastBlock = IntToBool(0xff & nRcvPkt[addrOff + 14]); moreDlmsBlocks = !lastBlock; dlmsBlockNum = decodeBlockNum(addrOff);
+                for (int i = addrOff + 19; i < pktLength - 1; i++) strbldDLMdata.append(Hex2Digit(nRcvPkt[i]));
+                appendLog("GPLS_FIRST_BLOCK lastBlock=" + lastBlock + " blockNum=" + dlmsBlockNum);
+            } else if ((nRcvPkt[addrOff + 11] & 0xff) == 0xC4 && (nRcvPkt[addrOff + 12] & 0xff) == 0x01) {
+                int resultByte = nRcvPkt[addrOff + 14] & 0xff;
+                appendLog("GPLS_NORMAL result=" + resultByte + " pktLen=" + pktLength);
+                if (resultByte == 0x00) {
+                    int typeTag = (addrOff + 20 < pktLength) ? (nRcvPkt[addrOff + 20] & 0xff) : 0;
+                    if (typeTag == 130) { for (int i = addrOff + 23; i < pktLength - 1; i++) strbldDLMdata.append(Hex2Digit(nRcvPkt[i])); }
+                    else if (typeTag == 129) { for (int i = addrOff + 22; i < pktLength - 1; i++) strbldDLMdata.append(Hex2Digit(nRcvPkt[i])); }
+                    else { for (int i = addrOff + 15; i < pktLength - 1; i++) strbldDLMdata.append(Hex2Digit(nRcvPkt[i])); }
+                } else { lastGplsResult = 1; appendLog("GPLS_ACCESS_ERROR OBIS=" + sOBISCode); }
+            } else { lastGplsResult = 2; appendLog("GPLS_UNKNOWN_FRAME OBIS=" + sOBISCode); }
+            final int MAX_DLMS_BLOCKS = 512; int dlmsBlockCount = 0;
+            while (moreDlmsBlocks && dlmsBlockCount < MAX_DLMS_BLOCKS) {
+                dlmsBlockCount++; if (abortRequested || (lpDeadlineMs > 0 && System.currentTimeMillis() > lpDeadlineMs)) { appendLog("GPLS_BLOCK_ABORT block=" + dlmsBlockNum); break; }
+                dlmsBlockNum++; appendLog("GPLS_GETBLOCK req=" + dlmsBlockNum);
+                nPkt[2] = (byte)(addrOff + 19);
+                nRetLSH = (byte)(0xff & ((int)nRecvCntr << 5)); nPkt[addrOff + 5] = (byte)((int)nRetLSH | 16);
+                nRetLSH = (byte)((int)nSentCntr << 1); nPkt[addrOff + 5] = (byte)((int)nRetLSH | (int)nPkt[addrOff + 5]);
+                int wp2 = addrOff + 8;
+                nPkt[wp2++]=(byte)0xE6; nPkt[wp2++]=(byte)0xE7; nPkt[wp2++]=(byte)0x00;
+                nPkt[wp2++]=(byte)0xC0; nPkt[wp2++]=(byte)0x02; nPkt[wp2++]=(byte)0x81; nPkt[wp2++]=(byte)0x00; nPkt[wp2++]=(byte)0x00;
+                nPkt[wp2++]=(byte)((dlmsBlockNum>>24)&0xFF); nPkt[wp2++]=(byte)((dlmsBlockNum>>16)&0xFF); nPkt[wp2++]=(byte)((dlmsBlockNum>>8)&0xFF); nPkt[wp2++]=(byte)(dlmsBlockNum&0xFF);
+                int gbEnd = wp2; fcs(nPkt, addrOff + 5, (byte)1); fcs(nPkt, gbEnd - 1, (byte)1); nPkt[gbEnd + 2] = (byte)0x7E; int gbSendLen = gbEnd + 3;
+                ClearBuffer(); byte[] gbCmd = new byte[gbSendLen]; for (int i = 0; i < gbSendLen; i++) gbCmd[i] = (byte)(nPkt[i] & 0xff);
+                SendPkt(port, gbCmd, gbSendLen);
+                boolean blockOk = false; byte blockRetries = 0; long tStart = System.currentTimeMillis();
+                do {
+                    do {
+                        if (abortRequested || (lpDeadlineMs > 0 && System.currentTimeMillis() > lpDeadlineMs)) { moreDlmsBlocks = false; blockOk = true; break; }
+                        DataReceive(port, 20);
+                        if (nCounter > 2) { int pLen = parsePktLen(); if (pLen > 0 && (pLen+2) <= nCounter && (pLen+1) < nRcvPkt.length && (nRcvPkt[pLen+1]&0xff)==0x7E && fcs(nRcvPkt, pLen, (byte)0)) { pktLength = pLen; blockOk = true; blockRetries = 0; FrameType(); break; } }
+                        long elapsed = System.currentTimeMillis() - tStart;
+                        if (elapsed/1000 > (int)nTimeOut && (int)blockRetries < (int)nTryCount) { blockRetries++; tStart = System.currentTimeMillis(); break; }
+                    } while ((int)blockRetries != (int)nTryCount);
+                } while (!blockOk && (int)blockRetries != (int)nTryCount);
+                if (!blockOk) { appendLog("GPLS_BLOCK_FAILED block=" + dlmsBlockNum); break; }
+                if (!moreDlmsBlocks) break;
+                if ((nRcvPkt[addrOff+5]&0xff)==0x97 || ((nRcvPkt[addrOff+5]&0xff)&1)==1) { appendLog("GPLS_BLOCK_ERR_FRAME"); break; }
+                if ((nRcvPkt[addrOff+11]&0xff)!=0xC4 || (nRcvPkt[addrOff+12]&0xff)!=0x02) { appendLog("GPLS_BLOCK_UNEXPECTED"); break; }
+                boolean lastBlock = IntToBool(0xff & nRcvPkt[addrOff + 14]); long receivedBlockNum = decodeBlockNum(addrOff); moreDlmsBlocks = !lastBlock;
+                appendLog("GPLS_BLOCK_RX num=" + receivedBlockNum + " last=" + lastBlock);
+                for (int i = addrOff + 19; i < pktLength - 1; i++) strbldDLMdata.append(Hex2Digit(nRcvPkt[i]));
+                int blockHdlc = 0;
+                while (((nRcvPkt[1]&0xff)&0xA8)==0xA8 && blockHdlc < MAX_HDLC_FRAMES) { blockHdlc++; if (!sendRR(port, addrOff, nTimeOut, nTryCount)) break; for (int i = addrOff+8; i < pktLength-1; i++) strbldDLMdata.append(Hex2Digit(nRcvPkt[i])); }
+            }
+            appendLog("GPLS_DONE OBIS=" + sOBISCode + " dlmsBlocks=" + dlmsBlockCount + " totalLen=" + strbldDLMdata.length());
+            SbData.append(strbldDLMdata); return SbData;
+        } catch (Exception ex) { appendLog("GPLS_EX OBIS=" + sOBISCode + ": " + ex.getMessage()); SbData.append(strbldDLMdata); return SbData; }
+    }
+
+    // =========================================================================
+    // ReadLoadSurveyData (full version — matches Reading.java exactly)
     // =========================================================================
 
     private StringBuilder ReadLoadSurveyData(UsbSerialPort port, int lsDays) {
-        StringBuilder sb = new StringBuilder();
-        appendLog("RLS_ENTER intProfilePd=" + intProfilePd);
-        StringBuilder d = ReadScalarUnit("BLOCKLOAD", port);
-        if (d != null && !d.toString().isEmpty()) sb.append(d);
+        StringBuilder strbldDLMdata = new StringBuilder(); StringBuilder DLMdata;
+        appendLog("RLS_ENTER lsDays=" + lsDays + " intProfilePd=" + intProfilePd);
+
+        DLMdata = ReadScalarUnit("BLOCKLOAD", port);
+        if (DLMdata != null && !DLMdata.toString().isEmpty()) strbldDLMdata.append(DLMdata);
+
         if (lastGplsResult == 2) {
-            appendLog("RLS_SESSION_DROP — re-establishing");
+            appendLog("RLS_SCALER_SESSION_DROP — re-establishing before LP reads");
             try {
-                AddressInit(); boolean nrmOk = SetNRM(port, bytWait, (byte) 2, bytTimOut);
-                if (nrmOk) { int ar = AARQ(port,(byte)1,currentMeterMake.password,bytWait,(byte)3,bytTimOut); if(ar==0){drainPort(port);lastGplsResult=0;} }
-            } catch (Exception e) { appendLog("RLS_RECOVER: " + e.getMessage()); }
+                AddressInit(); boolean nrmOk = SetNRM(port, bytWait, (byte)2, bytTimOut); appendLog("RLS_SCALER_RECOVER_NRM=" + nrmOk);
+                if (nrmOk) { int aarqRes = AARQ(port, (byte)1, currentMeterMake.password, bytWait, (byte)3, bytTimOut); appendLog("RLS_SCALER_RECOVER_AARQ=" + aarqRes); if (aarqRes == 0) { drainPort(port); lastGplsResult = 0; } }
+            } catch (Exception recEx) { appendLog("RLS_SCALER_RECOVER_EX: " + recEx.getMessage()); }
         }
-        StringBuilder l = new StringBuilder();
-        d = GetParameter(port,(byte)7,"0100630100FF",(byte)3,bytWait,(byte)1,bytTimOut,true,l);
-        if (lastGplsResult == 0 && d != null && d.length() > 23) sb.append(d);
-        else sb.append("\r\n0007 0100630100FF 03 " + getCaptureObjectsForMake());
-        l=new StringBuilder(); d=GetParameter(port,(byte)7,"0100630100FF",(byte)7,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
-        l=new StringBuilder(); d=GetParameter(port,(byte)7,"0100630100FF",(byte)8,bytWait,(byte)1,bytTimOut,true,l); if(hasMeaningfulDlmsPayload(d)) sb.append(d);
-        if (abortRequested) return sb;
-        int pMax=2016;
-        try {
-            String su=sb.toString().toUpperCase(); int ei=su.indexOf("0100630100FF 08 ");
-            if(ei>=0){int ps=ei+16;int le2=su.indexOf('\n',ps);if(le2<0)le2=su.length();String pl=su.substring(ps,le2).trim().replaceAll("\\s+","");
-                if(pl.startsWith("06")&&pl.length()>=10) pMax=(int)Long.parseLong(pl.substring(2,10),16);
-                else if(pl.startsWith("12")&&pl.length()>=6) pMax=Integer.parseInt(pl.substring(2,6),16);}
-        } catch (Exception ignored) {}
-        int pm=intProfilePd>0?intProfilePd:15; int days=Math.min((pMax*pm)/(24*60),35); if(days<=0) days=35;
-        appendLog("RLS_AUTO_DAYS=" + days);
-        try {
-            Calendar ec=Calendar.getInstance(); Calendar sc=Calendar.getInstance();
-            sc.add(Calendar.DATE,-days); sc.set(Calendar.HOUR_OF_DAY,0); sc.set(Calendar.MINUTE,0); sc.set(Calendar.SECOND,0);
-            l=new StringBuilder();
-            StringBuilder lpD=GetParameterSelective(port,(byte)7,"0100630100FF",(byte)2,bytWait,(byte)2,bytTimOut,true,sc.getTime(),ec.getTime(),intProfilePd,l);
-            if(lpD!=null&&lpD.length()>10){sb.append(lpD);appendLog("RLS_LP_LEN="+lpD.length());}
-        } catch (Exception e) { appendLog("RLS_LP_EX: "+e.getMessage()); }
-        return sb;
+
+        appendLog("RLS_CALL attr=3 (capture_objects)");
+        StringBuilder l3 = new StringBuilder();
+        DLMdata = GetParameter(port, (byte)7, "0100630100FF", (byte)3, bytWait, (byte)1, bytTimOut, true, l3);
+        appendLog("RLS_RET attr=3 len=" + (DLMdata == null ? -1 : DLMdata.length()) + " result=" + lastGplsResult);
+        if (lastGplsResult == 0 && DLMdata != null && DLMdata.length() > 23) {
+            strbldDLMdata.append(DLMdata); appendLog("RLS_ATTR3_FROM_METER len=" + DLMdata.length());
+        } else {
+            strbldDLMdata.append("\r\n0007 0100630100FF 03 ").append(getCaptureObjectsForMake());
+            appendLog("RLS_ATTR3_HARDCODED make=" + currentMeterMake.displayName);
+        }
+
+        boolean lpIncompatible = false;
+        if (lastGplsResult == 2) {
+            appendLog("RLS_ATTR3_DM — re-establishing for remaining reads");
+            try {
+                AddressInit(); boolean nrmOk = SetNRM(port, bytWait, (byte)2, bytTimOut); appendLog("RLS_ATTR3_RECOVER_NRM=" + nrmOk);
+                if (nrmOk) { int aarqRes = AARQ(port, (byte)1, currentMeterMake.password, bytWait, (byte)3, bytTimOut); appendLog("RLS_ATTR3_RECOVER_AARQ=" + aarqRes); if (aarqRes == 0) { drainPort(port); lastGplsResult = 0; } else { lpIncompatible = true; } } else { lpIncompatible = true; }
+            } catch (Exception reEx) { appendLog("RLS_ATTR3_RECOVER_EX: " + reEx.getMessage()); lpIncompatible = true; }
+        }
+        if (lpIncompatible) {
+            appendLog("RLS_SKIP_ALL (lpIncompatible=true)");
+            strbldDLMdata.append("\r\n0007 0100630100FF 07 0600000000");
+            return strbldDLMdata;
+        }
+
+        appendLog("RLS_CALL attr=4 (capture_period_seconds)");
+        StringBuilder attr4Sb = new StringBuilder();
+        DLMdata = GetParameter(port, (byte)7, "0100630100FF", (byte)4, bytWait, (byte)1, bytTimOut, false, attr4Sb);
+        appendLog("RLS_RET attr=4 len=" + (DLMdata == null ? -1 : DLMdata.length()));
+        int capturePeriodMin = intProfilePd > 0 ? intProfilePd : 30;
+        if (lastGplsResult == 0) {
+            try { String raw = attr4Sb.toString(); if (raw.length() >= 8) { long seconds = Long.parseLong(raw.substring(raw.length() - 8), 16); if (seconds > 0 && seconds <= 86400) { capturePeriodMin = (int)(seconds / 60); appendLog("RLS_ATTR4_SECONDS=" + seconds); } } } catch (Exception ignored) {}
+        }
+        if (capturePeriodMin > 0) intProfilePd = capturePeriodMin;
+        appendLog("RLS_CAPTURE_PERIOD_MIN=" + capturePeriodMin);
+
+        appendLog("RLS_CALL attr=7 (entries_in_use)");
+        StringBuilder attr7Sb = new StringBuilder();
+        DLMdata = GetParameter(port, (byte)7, "0100630100FF", (byte)7, bytWait, (byte)1, bytTimOut, false, attr7Sb);
+        appendLog("RLS_RET attr=7 len=" + (DLMdata == null ? -1 : DLMdata.length()));
+        int entriesInUse = 0;
+        if (lastGplsResult == 0) { try { String raw = attr7Sb.toString(); if (raw.length() >= 8) entriesInUse = (int)Long.parseLong(raw.substring(raw.length() - 8), 16); } catch (Exception ignored) {} }
+        appendLog("RLS_ENTRIES_IN_USE=" + entriesInUse);
+
+        int recPerDay = (capturePeriodMin > 0) ? (24 * 60 / capturePeriodMin) : 48;
+        int profileEntriesMax = 0;
+        appendLog("RLS_CALL attr=8 (profile_entries_max)");
+        DLMdata = GetParameter(port, (byte)7, "0100630100FF", (byte)8, bytWait, (byte)1, bytTimOut, true, strbldDLMdata);
+        appendLog("RLS_RET attr=8 len=" + (DLMdata == null ? -1 : DLMdata.length()));
+        if (lastGplsResult == 0 && DLMdata != null && !DLMdata.toString().isEmpty()) {
+            try { String raw = DLMdata.toString().trim(); if (raw.length() >= 2) { int t8 = Integer.parseInt(raw.substring(0, 2), 16); if (t8 == 0x12 && raw.length() >= 6) profileEntriesMax = Integer.parseInt(raw.substring(2, 6), 16); else if (t8 == 0x06 && raw.length() >= 10) profileEntriesMax = (int)Long.parseLong(raw.substring(2, 10), 16); } } catch (Exception ignored) {}
+        }
+
+        int maxDaysFromMeter;
+        if (entriesInUse > 0 && recPerDay > 0) { maxDaysFromMeter = Math.max(1, (entriesInUse / recPerDay) + 1); appendLog("RLS_DAYS_FROM_EIU: entriesInUse=" + entriesInUse + " recPerDay=" + recPerDay + " → lsDays=" + maxDaysFromMeter); }
+        else if (profileEntriesMax > 0 && recPerDay > 0) { maxDaysFromMeter = Math.min(lsDays, profileEntriesMax / recPerDay); appendLog("RLS_DAYS_FROM_ATTR8: profileEntriesMax=" + profileEntriesMax + " → lsDays=" + maxDaysFromMeter); }
+        else { maxDaysFromMeter = lsDays; appendLog("RLS_DAYS_FALLBACK → lsDays=" + maxDaysFromMeter); }
+        final int MAX_LP_DAYS = 35;
+        if (maxDaysFromMeter > MAX_LP_DAYS) { appendLog("RLS_DAYS_CAPPED from=" + maxDaysFromMeter + " to=" + MAX_LP_DAYS); maxDaysFromMeter = MAX_LP_DAYS; }
+        lsDays = maxDaysFromMeter;
+        appendLog("RLS_RECORDS_NEEDED=" + (recPerDay * lsDays) + " recPerDay=" + recPerDay + " lsDays=" + lsDays);
+
+        boolean bulkReadOk = false; boolean bulkCausedDM = false;
+        java.util.List<String> lpPageHexList = new java.util.ArrayList<>();
+        int[] lpEntriesDeclared = {entriesInUse};
+        java.util.HashSet<String> seenPayloads = new java.util.HashSet<>();
+        int totalActualRecords = 0;
+
+        boolean tryBulk = (currentMeterMake == MeterMake.GENUS || currentMeterMake == MeterMake.AVON);
+        if (tryBulk) {
+            appendLog("RLS_CALL attr=2 bulk (Genus/AVON only)");
+            StringBuilder attr2Sb = new StringBuilder(); long attr2Start = System.currentTimeMillis();
+            DLMdata = GetParameter_LS(port, (byte)7, "0100630100FF", (byte)2, bytWait, bytTryCnt, bytTimOut, false, attr2Sb);
+            long attr2Elapsed = System.currentTimeMillis() - attr2Start;
+            appendLog("RLS_RET attr=2 elapsed=" + attr2Elapsed + "ms len=" + (DLMdata == null ? -1 : DLMdata.length()) + " result=" + lastGplsResult);
+            bulkReadOk = (DLMdata != null && DLMdata.length() > 30 && lastGplsResult == 0);
+            bulkCausedDM = (lastGplsResult == 2);
+            appendLog("RLS_BULK_CHECK ok=" + bulkReadOk + " causedDM=" + bulkCausedDM);
+        } else { appendLog("RLS_BULK_SKIP make=" + currentMeterMake.displayName); }
+
+        if (bulkReadOk) {
+            String lpHex = DLMdata.toString();
+            try { byte[] lpBytes = hexStringToByteArray(lpHex.length() > 1 ? lpHex : ""); for (int bi = 0; bi < Math.min(16, lpBytes.length - 2); bi++) { if ((lpBytes[bi]&0xff)==0x82) { int declared = ((lpBytes[bi+1]&0xff)<<8)|(lpBytes[bi+2]&0xff); if (declared > 0) { lpEntriesDeclared[0] = declared; break; } } } } catch (Exception ignored) {}
+            int cnt = countLoadProfileRecords(lpHex); totalActualRecords = cnt; lpPageHexList.add(lpHex);
+            appendLog("RLS_BULK_OK len=" + lpHex.length() + " declared=" + lpEntriesDeclared[0] + " actualRecords=" + cnt);
+            boolean partialBulk = (lpEntriesDeclared[0] > cnt && cnt > 0);
+            if (partialBulk) {
+                appendLog("RLS_PARTIAL_BULK declared=" + lpEntriesDeclared[0] + " received=" + cnt + " — trying selective");
+                abortPendingBlockTransfer(port); drainPort(port);
+                Calendar pcal = Calendar.getInstance(); int selOk = 0;
+                for (int i = Math.min(lsDays, 7); i >= 0; i--) {
+                    if (abortRequested) break;
+                    if (lpDeadlineMs > 0 && System.currentTimeMillis() > lpDeadlineMs) break;
+                    pcal = Calendar.getInstance(); pcal.add(Calendar.DATE, -i); pcal.set(Calendar.HOUR_OF_DAY, 0); pcal.set(Calendar.MINUTE, 0); pcal.set(Calendar.SECOND, 0); pcal.set(Calendar.MILLISECOND, 0);
+                    java.util.Date dayDate = pcal.getTime();
+                    DLMdata = GetParameterSelective(port, (byte)7, "0100630100FF", (byte)2, bytWait, bytTryCnt, bytTimOut, false, dayDate, dayDate, capturePeriodMin, new StringBuilder());
+                    if (DLMdata != null && !DLMdata.toString().isEmpty()) {
+                        String selHex = DLMdata.toString().trim();
+                        if (!hasLoadProfileRecords(selHex)) continue; if (seenPayloads.contains(selHex)) continue;
+                        if (lpHex.contains(selHex.substring(0, Math.min(40, selHex.length())))) continue;
+                        seenPayloads.add(selHex); int selCnt = countLoadProfileRecords(selHex); totalActualRecords += selCnt; lpPageHexList.add(selHex); selOk++;
+                        appendLog("RLS_PARTIAL_SEL day=-" + i + " records=" + selCnt);
+                    }
+                }
+                if (selOk > 0) appendLog("RLS_PARTIAL_SUPPLEMENT added " + selOk + " selective days, totalRecords=" + totalActualRecords);
+            }
+        }
+
+        if (bulkCausedDM) {
+            appendLog("RLS_BULK_DM — re-establishing for selective reads");
+            try {
+                AddressInit(); boolean nrmOk = SetNRM(port, bytWait, (byte)2, bytTimOut); appendLog("RLS_BULK_RECOVER_NRM=" + nrmOk);
+                if (nrmOk) { int aarqRes = AARQ(port, (byte)1, currentMeterMake.password, bytWait, (byte)3, bytTimOut); appendLog("RLS_BULK_RECOVER_AARQ=" + aarqRes); if (aarqRes == 0) { drainPort(port); lastGplsResult = 0; } }
+            } catch (Exception bulkEx) { appendLog("RLS_BULK_RECOVER_EX: " + bulkEx.getMessage()); }
+        }
+
+        if (!bulkReadOk) {
+            appendLog("RLS_BULK_FAILED — falling back to selective read for " + lsDays + " days");
+            boolean probeHadData = false; boolean bulkFallbackUsed = false;
+            if (entriesInUse == 0) {
+                if (abortRequested) {
+                    appendLog("RLS_PROBE_SKIPPED_ABORT");
+                } else {
+                    appendLog("RLS_PROBE_EMPTY_METER — probing recent days before skipping");
+                    for (int probeDayOffset = 0; probeDayOffset >= -3 && !probeHadData; probeDayOffset--) {
+                        java.util.Calendar probeCal = java.util.Calendar.getInstance();
+                        probeCal.add(java.util.Calendar.DAY_OF_YEAR, probeDayOffset);
+                        probeCal.set(java.util.Calendar.HOUR_OF_DAY, 0); probeCal.set(java.util.Calendar.MINUTE, 0); probeCal.set(java.util.Calendar.SECOND, 0); probeCal.set(java.util.Calendar.MILLISECOND, 0);
+                        java.util.Date probeDate = probeCal.getTime();
+                        appendLog("RLS_PROBE_DAY offset=" + probeDayOffset);
+                        DLMdata = GetParameterSelective(port, (byte)7, "0100630100FF", (byte)2, bytWait, (byte)1, bytTimOut, false, probeDate, probeDate, capturePeriodMin, new StringBuilder());
+                        if (DLMdata != null && !DLMdata.toString().isEmpty()) {
+                            String probeHex = DLMdata.toString().trim();
+                            if (hasLoadProfileRecords(probeHex)) { probeHadData = true; int probeCnt = countLoadProfileRecords(probeHex); totalActualRecords += probeCnt; lpPageHexList.add(probeHex); seenPayloads.add(probeHex); appendLog("RLS_PROBE_HAS_DATA offset=" + probeDayOffset + " records=" + probeCnt); }
+                        }
+                    }
+                    if (!probeHadData) {
+                        appendLog("RLS_PROBE_CONFIRMED_EMPTY — no LP data in last 3 days via selective");
+                        if (!abortRequested && currentMeterMake != MeterMake.GENUS && currentMeterMake != MeterMake.AVON) {
+                            appendLog("RLS_BULK_FALLBACK_PROBE — attempting direct attr=2 bulk read");
+                            StringBuilder bulkProbeSb = new StringBuilder();
+                            DLMdata = GetParameter_LS(port, (byte)7, "0100630100FF", (byte)2, bytWait, (byte)1, bytTimOut, false, bulkProbeSb);
+                            if (DLMdata != null && DLMdata.length() > 30) {
+                                String bulkHex = DLMdata.toString().trim();
+                                if (hasLoadProfileRecords(bulkHex)) { int bulkCnt = countLoadProfileRecords(bulkHex); probeHadData = true; bulkFallbackUsed = true; totalActualRecords += bulkCnt; lpPageHexList.add(bulkHex); seenPayloads.add(bulkHex); appendLog("RLS_BULK_FALLBACK_HAS_DATA records=" + bulkCnt); }
+                                else { appendLog("RLS_BULK_FALLBACK_EMPTY"); }
+                            } else { appendLog("RLS_BULK_FALLBACK_NO_RESPONSE"); }
+                        }
+                        if (!probeHadData) appendLog("RLS_SEL_SKIP_ALL — LP confirmed empty by both selective and bulk probe");
+                    }
+                }
+            }
+
+            if ((entriesInUse > 0 || probeHadData) && !bulkFallbackUsed) {
+                Calendar cal = Calendar.getInstance(); int selectiveOk = 0; int targetRecords = recPerDay * lsDays;
+                int etaSecs = lsDays * 16; String etaStr = etaSecs < 60 ? etaSecs + "s" : (etaSecs/60) + "m " + (etaSecs%60) + "s";
+                appendLog("LP: reading " + lsDays + " days | Target ~" + targetRecords + " records | ETA ~" + etaStr);
+                for (int i = lsDays; i >= 0; i--) {
+                    if (abortRequested) { appendLog("RLS_SEL_ABORT at day=" + i); break; }
+                    if (lpDeadlineMs > 0 && System.currentTimeMillis() > lpDeadlineMs) { appendLog("RLS_SEL_DEADLINE_HIT at day=" + i); break; }
+                    cal = Calendar.getInstance(); cal.add(Calendar.DATE, -i);
+                    cal.set(Calendar.HOUR_OF_DAY, 0); cal.set(Calendar.MINUTE, 0); cal.set(Calendar.SECOND, 0); cal.set(Calendar.MILLISECOND, 0);
+                    java.util.Date dayDate = cal.getTime();
+                    DLMdata = GetParameterSelective(port, (byte)7, "0100630100FF", (byte)2, bytWait, bytTryCnt, bytTimOut, false, dayDate, dayDate, capturePeriodMin, new StringBuilder());
+                    if (DLMdata != null && !DLMdata.toString().isEmpty()) {
+                        String lpHex = DLMdata.toString().trim();
+                        if (!hasLoadProfileRecords(lpHex)) { appendLog("RLS_SEL_DAY day=-" + i + " EMPTY_SKIPPED len=" + lpHex.length()); continue; }
+                        if (seenPayloads.contains(lpHex)) { appendLog("RLS_SEL_DAY day=-" + i + " DUPLICATE_SKIPPED"); continue; }
+                        seenPayloads.add(lpHex);
+                        if (entriesInUse > 0 && totalActualRecords > (int)(entriesInUse * 1.2)) { appendLog("RLS_EARLY_STOP totalRecords=" + totalActualRecords + " > entriesInUse×1.2=" + (int)(entriesInUse * 1.2)); break; }
+                        if (lpEntriesDeclared[0] == 0) { try { byte[] lpBytes = hexStringToByteArray(lpHex); for (int bi = 0; bi < Math.min(16, lpBytes.length - 2); bi++) { if ((lpBytes[bi]&0xff)==0x82) { int declared = ((lpBytes[bi+1]&0xff)<<8)|(lpBytes[bi+2]&0xff); if (declared > 0) { lpEntriesDeclared[0] = declared; break; } } } } catch (Exception ignored) {} }
+                        int cnt = countLoadProfileRecords(lpHex); totalActualRecords += cnt;
+                        if (capturePeriodMin == 30 && cnt >= 2) {
+                            try {
+                                int p1 = lpHex.indexOf("0212090c"); int p2 = lpHex.indexOf("0212090c", p1 + 8);
+                                if (p1 >= 0 && p2 >= 0) {
+                                    String ts1 = lpHex.substring(p1+8,p1+32); String ts2 = lpHex.substring(p2+8,p2+32);
+                                    int h1=Integer.parseInt(ts1.substring(10,12),16); int m1=Integer.parseInt(ts1.substring(12,14),16);
+                                    int h2=Integer.parseInt(ts2.substring(10,12),16); int m2=Integer.parseInt(ts2.substring(12,14),16);
+                                    int diff=(h2*60+m2)-(h1*60+m1);
+                                    if (diff==15||diff==30||diff==60) { if(diff!=capturePeriodMin){capturePeriodMin=diff;intProfilePd=diff;appendLog("RLS_INTERVAL_DETECTED="+diff+"min from timestamps");} }
+                                }
+                            } catch (Exception ignored) {}
+                        }
+                        lpPageHexList.add(lpHex); selectiveOk++;
+                        appendLog("RLS_SEL_DAY day=-" + i + " len=" + lpHex.length() + " records=" + cnt);
+                        int maxPageRetries = 6; int pagesDone = 0;
+                        while (cnt > 0 && cnt < recPerDay && pagesDone < maxPageRetries) {
+                            if (abortRequested) break;
+                            if (lpDeadlineMs > 0 && System.currentTimeMillis() > lpDeadlineMs) { appendLog("RLS_PAGE_DEADLINE day=-" + i); break; }
+                            java.util.Date nextStart = extractLastLpTimestamp(lpHex, capturePeriodMin);
+                            if (nextStart == null) { appendLog("RLS_PAGE_NO_LAST_TS day=-" + i); break; }
+                            appendLog("RLS_PAGE_CONT day=-" + i + " page=" + (pagesDone+1) + " nextStart=" + nextStart);
+                            DLMdata = GetParameterSelective(port, (byte)7, "0100630100FF", (byte)2, bytWait, bytTryCnt, bytTimOut, false, nextStart, dayDate, capturePeriodMin, new StringBuilder());
+                            if (DLMdata == null || DLMdata.toString().isEmpty()) break;
+                            String pageHex = DLMdata.toString().trim();
+                            if (!hasLoadProfileRecords(pageHex)) break; if (seenPayloads.contains(pageHex)) break;
+                            seenPayloads.add(pageHex); int pageCnt = countLoadProfileRecords(pageHex); if (pageCnt == 0) break;
+                            totalActualRecords += pageCnt; cnt += pageCnt; lpHex = pageHex; lpPageHexList.add(pageHex); pagesDone++;
+                            appendLog("RLS_PAGE_DONE day=-" + i + " page=" + pagesDone + " pageCnt=" + pageCnt + " dayTotal=" + cnt);
+                        }
+                        appendLog("LP Day " + (lsDays-i+1) + "/" + (lsDays+1) + " | " + totalActualRecords + " of ~" + targetRecords + " records received");
+                    } else { appendLog("RLS_SEL_DAY day=-" + i + " NO_DATA"); }
+                }
+                appendLog("RLS_SEL_DONE daysWithData=" + selectiveOk + " totalRecords=" + totalActualRecords);
+            }
+        }
+
+        int attr3Value = lpEntriesDeclared[0] > 0 ? lpEntriesDeclared[0] : totalActualRecords;
+        strbldDLMdata.append("\r\n0007 0100630100FF 07 06").append(String.format("%08x", attr3Value));
+        appendLog("RLS_ATTR7_WRITTEN entries_in_use=" + attr3Value);
+        if (!lpPageHexList.isEmpty()) {
+            String mergedLp = mergeLpPageHexList(lpPageHexList);
+            if (mergedLp != null) { strbldDLMdata.append("\r\n0007 0100630100FF 02 ").append(mergedLp); appendLog("RLS_LP_MERGED pages=" + lpPageHexList.size() + " totalRecords=" + totalActualRecords); }
+        }
+        return strbldDLMdata;
     }
 
     // =========================================================================
