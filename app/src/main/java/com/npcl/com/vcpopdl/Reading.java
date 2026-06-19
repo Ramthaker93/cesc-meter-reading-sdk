@@ -1,3 +1,5 @@
+// VERSION: V28 — Billing block stall fix: per-block 30s deadline + billingDeadlineMs in moreBlocks loop (2026-06-19)
+// V27: REASSOC skipped when abortRequested; V26: HTML popup suppressed
 package com.npcl.com.vcpopdl;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
@@ -1201,8 +1203,13 @@ public class Reading extends AppCompatActivity {
                                     // FIX: Send DISC+SNRM+AARQ to re-open the association.
                                     // Cost: ~1-2s. Benefit: all event data recovered.
                                     // Safe for all makes: harmless if association is still alive.
-                                    appendLog("REASSOC_START — re-establishing COSEM association before events");
+                                    // V27: Skip REASSOC entirely if port already died (SEND_FAIL_ABORT
+                                    // set abortRequested=true during LP). SetNRM on a dead port wastes
+                                    // ~8s (2 tries x 4s timeout) before failing. ReadEventData below
+                                    // already handles abortRequested via EVENT_LOOP_ABORT.
                                     boolean reAssocOk = false;
+                                    if (!abortRequested) {
+                                    appendLog("REASSOC_START — re-establishing COSEM association before events");
                                     try {
                                         drainPort(port);
                                         android.os.SystemClock.sleep(200);
@@ -1217,6 +1224,9 @@ public class Reading extends AppCompatActivity {
                                         }
                                     } catch (Exception reEx) {
                                         appendLog("REASSOC_EX: " + reEx.getMessage());
+                                    }
+                                    } else {
+                                        appendLog("REASSOC_SKIPPED — abortRequested=true (port dead), skipping re-association");
                                     }
                                     bytTimOut = fastTimOut;
                                     bytTryCnt = fastTryCnt;
@@ -1416,7 +1426,9 @@ public class Reading extends AppCompatActivity {
                                     "dd-MM-yyyy HH:mm", java.util.Locale.getDefault()).format(new java.util.Date()))
                             .apply();
 
-                    showMeterReadingDialog(dispMeterNo, lastMeterData, readingMode);
+                    // showMeterReadingDialog(dispMeterNo, lastMeterData, readingMode);
+                    // V26: HTML summary popup hidden — dialog suppressed per user request.
+                    // Re-enable by un-commenting the line above.
                 } catch (Exception e) {
                     appendLog("ERROR: Failed to show meter readings: " + e.getMessage());
                 }
@@ -6611,6 +6623,15 @@ public class Reading extends AppCompatActivity {
             int contFrameCount = 0;
             while (((int) (0xff & this.nRcvPkt[1]) & 168) == 168) {
                 contFrameCount++;
+                // V28 FIX: Check billing deadline at top of moreBlocks loop.
+                // This loop had NO deadline protection — the do-while inside only checked
+                // lpDeadlineMs which is 0 during billing, so billing could stall
+                // indefinitely (confirmed: KT342539 stalled 429s on block 2).
+                if (abortRequested || (billingDeadlineMs > 0 && System.currentTimeMillis() > billingDeadlineMs)) {
+                    appendLog("GP1_MOREBLOCKS_DEADLINE_ABORT frame=" + contFrameCount
+                            + " — billingDeadline exceeded in moreBlocks loop");
+                    break;
+                }
                 this.nPkt[2] = (byte) ((int) this.bytAddMode + 7);
                 this.nRetLSH = (byte) (0xff & ((int) this.nRecvCntr) << 5);
                 this.nPkt[((0xff & this.bytAddMode) + 5)] = (byte) ((int) this.nRetLSH | 16);
@@ -6804,10 +6825,18 @@ public class Reading extends AppCompatActivity {
                 this.nPkt[(int) num63 + 2] = (byte) 126;
                 byte num65 = (byte) 0;
                 boolean flag3;
+                // V28 FIX: Per-block deadline — 30s max per individual block.
+                // Without this, each failed block attempt consumed nTryCount×nTimeOut=24s,
+                // and 18 failed attempts × 24s = 432s before billingDeadlineMs fired.
+                // With per-block deadline: max 30s per block regardless of nTryCount.
+                long blockDeadlineMs = System.currentTimeMillis() + 30_000L;
                 do {
-                    // FIX: Check billing deadline inside block-transfer retry loop
-                    if (abortRequested || (lpDeadlineMs > 0 && System.currentTimeMillis() > lpDeadlineMs)) {
-                        appendLog("GP1_BLOCK_DEADLINE_ABORT blockNum=" + num1 + " — deadline or abort");
+                    // Check both billing deadline AND per-block deadline
+                    if (abortRequested
+                            || (billingDeadlineMs > 0 && System.currentTimeMillis() > billingDeadlineMs)
+                            || System.currentTimeMillis() > blockDeadlineMs) {
+                        appendLog("GP1_BLOCK_DEADLINE_ABORT blockNum=" + num1
+                                + " — billingDeadline or blockDeadline(30s) or abort");
                         flag3 = false;
                         num65 = nTryCount;
                         break;
