@@ -570,6 +570,7 @@ public class ReadingSDK {
                             MeterData.append(billingData);
                             long tBillElapsed = System.currentTimeMillis() - tBillStart;
                             appendLog("BILLING_DONE elapsed=" + tBillElapsed + "ms");
+                            flushLog(); // V29: flush so billing logs appear in file even if LP is slow
                             if (billingData != null && billingData.length() > 0) {
                                 fireProgress(callback, "✓ Billing done (" + (tBillElapsed/1000) + "s)", 50);
                                 UpdateStatus(CescRajMeterno, "Billing OK");
@@ -592,6 +593,7 @@ public class ReadingSDK {
                                 long tMidElapsed = System.currentTimeMillis() - tMidStart;
                                 fireProgress(callback, "✓ Midnight done (" + (tMidElapsed/1000) + "s)", 58);
                                 UpdateStatus(CescRajMeterno, "Midnight OK");
+                                flushLog(); // V29: flush before LP so midnight logs are on disk
 
                                 // ── Phase 4: Load Profile ─────────────────────────────────
                                 // LP budget = remaining session time minus 30s events buffer.
@@ -6589,7 +6591,12 @@ public class ReadingSDK {
      * If no transfer is in progress, the meter returns errClass=11 — harmless.
      */
     private void abortPendingBlockTransfer(UsbSerialPort port) {
-        lpDeadlineMs = 0; // LOW-1 FIX: reset deadline so next read doesn't inherit stale timeout
+        // NOTE: do NOT reset lpDeadlineMs here. This method is called mid-session
+        // after a partial bulk transfer; the LP deadline set by doInBackground must
+        // remain active so the subsequent selective-access fallback loop still terminates
+        // on time. Resetting it to 0 makes all "(lpDeadlineMs > 0 && ...)" guards
+        // evaluate to false, causing LP to run completely unchecked.
+        // (V29 FIX — was: lpDeadlineMs = 0)
         try {
             int addrOff = 0xff & this.bytAddMode;
 

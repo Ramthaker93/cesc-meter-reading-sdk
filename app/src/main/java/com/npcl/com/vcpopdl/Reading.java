@@ -1,4 +1,5 @@
-// VERSION: V28 — Billing block stall fix: per-block 30s deadline + billingDeadlineMs in moreBlocks loop (2026-06-19)
+// VERSION: V29 — LP deadline bug fix: abortPendingBlockTransfer no longer resets lpDeadlineMs (was causing LP to run indefinitely after partial bulk transfer); flushLog after billing+midnight so phase logs appear in file during long LP reads; comment fix SESSION_MAX_SECONDS 7→9 min (2026-06-20)
+// V28: Billing block stall fix: per-block 30s deadline + billingDeadlineMs in moreBlocks loop (2026-06-19)
 // V27: REASSOC skipped when abortRequested; V26: HTML popup suppressed
 package com.npcl.com.vcpopdl;
 import androidx.core.app.ActivityCompat;
@@ -180,7 +181,7 @@ public class Reading extends AppCompatActivity {
     private AsyncTaskRunner  currentTask     = null;
     // LP deadline — set before ReadLoadSurveyData, checked inside GPLS loops
     private volatile long    lpDeadlineMs    = 0;
-    // Session deadline — set at start of COMPLETE mode, hard cap of 7 minutes total.
+    // Session deadline — set at start of COMPLETE mode, hard cap of 9 minutes total.
     // Checked before each phase. When exceeded, remaining phases are skipped and
     // whatever data was collected is written to file as a partial/complete result.
     private volatile long    sessionDeadlineMs = 0;
@@ -222,11 +223,9 @@ public class Reading extends AppCompatActivity {
         try {
             super.onCreate(savedInstanceState);
             setContentView(R.layout.activity_reading);
-
             // --- Set user display (bypass login) ---
             EditText eduser = (EditText) findViewById(R.id.txtuser);
             eduser.setText(BYPASS_USER_ID);
-
             // --- Init DB schema ---
             DatabaseHandler db1 = new DatabaseHandler(getApplicationContext());
             db1.onCreate();
@@ -1129,6 +1128,7 @@ public class Reading extends AppCompatActivity {
                             MeterData.append(billingData);
                             long tBillElapsed = System.currentTimeMillis() - tBillStart;
                             appendLog("BILLING_DONE elapsed=" + tBillElapsed + "ms");
+                            flushLog(); // V29: flush so billing logs appear in file even if LP is slow
                             if (billingData != null && billingData.length() > 0) {
                                 publishProgress("INFO|✓ Billing done (" + (tBillElapsed/1000) + "s)", "50");
                                 UpdateStatus(CescRajMeterno, "Billing OK");
@@ -1151,6 +1151,7 @@ public class Reading extends AppCompatActivity {
                                 long tMidElapsed = System.currentTimeMillis() - tMidStart;
                                 publishProgress("INFO|✓ Midnight done (" + (tMidElapsed/1000) + "s)", "58");
                                 UpdateStatus(CescRajMeterno, "Midnight OK");
+                                flushLog(); // V29: flush before LP so midnight logs are on disk
 
                                 // ── Phase 4: Load Profile ─────────────────────────────────
                                 // LP budget = remaining session time minus 30s events buffer.
@@ -7863,7 +7864,12 @@ public class Reading extends AppCompatActivity {
      * If no transfer is in progress, the meter returns errClass=11 — harmless.
      */
     private void abortPendingBlockTransfer(UsbSerialPort port) {
-        lpDeadlineMs = 0; // LOW-1 FIX: reset deadline so next read doesn't inherit stale timeout
+        // NOTE: do NOT reset lpDeadlineMs here. This method is called mid-session
+        // after a partial bulk transfer; the LP deadline set by doInBackground must
+        // remain active so the subsequent selective-access fallback loop still terminates
+        // on time. Resetting it to 0 makes all "(lpDeadlineMs > 0 && ...)" guards
+        // evaluate to false, causing LP to run completely unchecked.
+        // (V29 FIX — was: lpDeadlineMs = 0)
         try {
             int addrOff = 0xff & this.bytAddMode;
 
