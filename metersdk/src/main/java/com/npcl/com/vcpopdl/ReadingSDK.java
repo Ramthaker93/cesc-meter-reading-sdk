@@ -9042,6 +9042,9 @@ public class ReadingSDK {
         }
         if (capturePeriodMin > 0) this.intProfilePd = capturePeriodMin;
         appendLog("RLS_CAPTURE_PERIOD_MIN=" + capturePeriodMin);
+        // V30: write LP1 attr=04 to TXT so the .NET converter can set INTERVALPERIOD correctly.
+        // Previously only stored in attr4Sb (internal) — converter never saw it and defaulted to 30-min.
+        strbldDLMdata.append(String.format("\r\n0007 0100630100FF 04 06%08X", (long) capturePeriodMin * 60));
 
         // ----------------------------------------------------------------
         // STEP 3 – EntriesInUse (attr=7, uint32).
@@ -9540,6 +9543,11 @@ public class ReadingSDK {
                 strbldDLMdata.append("\r\n0007 0100630100FF 02 ").append(mergedLp);
                 appendLog("RLS_LP_MERGED pages=" + lpPageHexList.size() + " totalRecords=" + totalActualRecords);
             }
+        } else {
+            // V30: always write LP1 attr=02 even when buffer is empty, so the .NET
+            // converter knows LP1 was checked. "0100" = DLMS array with 0 elements.
+            strbldDLMdata.append("\r\n0007 0100630100FF 02 0100");
+            appendLog("RLS_LP_EMPTY_MARKER — entries_in_use=0 and probe found no data; writing empty array to TXT");
         }
 
         return strbldDLMdata;
@@ -9865,10 +9873,27 @@ public class ReadingSDK {
             DLMdata = this.GetParameter_LS(port, (byte) 7, "0100630200FF", (byte) 2,
                     this.bytWait, this.bytTryCnt, this.bytTimOut, true, strbldDLMdata);
         }
+        // V30 FIX: Genus LP2 anomaly — some Genus firmware echoes entries_in_use as a
+        // uint32 scalar (DLMS tag 0x06, 5 bytes total = 10 hex chars) instead of returning
+        // the actual buffer array when selective access is used. hasMeaningfulDlmsPayload()
+        // accepts this non-empty response, preventing the fallback below from triggering.
+        // Detect it here: if payload is exactly 10 hex chars starting with "06", it is a
+        // scalar uint32, not a profile buffer array (which starts with "01" array tag).
+        // Discard the scalar and let the MIDNIGHT_SEL_EMPTY fallback retry with GetParameter_LS.
+        if (hasMeaningfulDlmsPayload(DLMdata)) {
+            String[] _mp = DLMdata.toString().trim().split("\\s+");
+            String _mpx = _mp[_mp.length - 1].toUpperCase();
+            if (_mpx.length() == 10 && _mpx.startsWith("06")) {
+                appendLog("MIDNIGHT_SEL_SCALAR: uint32 echo 0x" + _mpx.substring(2)
+                        + " (val=" + Long.parseLong(_mpx.substring(2), 16)
+                        + ") — Genus LP2 selective-access anomaly, discarding and retrying with LS");
+                DLMdata = null;
+            }
+        }
         if (hasMeaningfulDlmsPayload(DLMdata))
             strbldDLMdata.append(DLMdata);
         else {
-            // Fall back to full buffer read if selective access returns empty
+            // Fall back to full buffer read if selective access returns empty or was discarded
             appendLog("MIDNIGHT_SEL_EMPTY — retrying with full buffer read");
             DLMdata = this.GetParameter_LS(port, (byte) 7, "0100630200FF", (byte) 2,
                     this.bytWait, this.bytTryCnt, this.bytTimOut, true, strbldDLMdata);
