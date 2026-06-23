@@ -8844,6 +8844,11 @@ public class ReadingSDK {
         if (text.isEmpty()) return false;
         // Extract hex payload: last whitespace token (GetParameter format: "COUNT OBIS ATTR <hex>")
         String[] parts = text.split("\\s+");
+        // V32 FIX: fewer than 4 tokens means no payload was written (e.g. L&T LP2 selective
+        // access returns an empty line "0007 0100630200FF 02 " with no hex after the attr).
+        // Without this guard parts[last] = "02" (the attr number) which passes all
+        // subsequent checks and causes a false-positive "meaningful" result.
+        if (parts.length < 4) return false;
         String payload = parts[parts.length - 1].toUpperCase();
         // All-zero: meter returned zero-fill
         if (payload.matches("0+")) return false;
@@ -9869,9 +9874,29 @@ public class ReadingSDK {
                     this.bytWait, this.bytTryCnt, this.bytTimOut, true,
                     calStart.getTime(), calEnd.getTime(), 1440); // 1440 min = 1 day capture period
         } catch (Exception e) {
+            // V32 FIX: same echo-leak guard as the empty-path LS fallback below — use a
+            // separate StringBuilder so if the LS result is also a uint32 echo it can be
+            // discarded BEFORE reaching strbldDLMdata.  The old code passed strbldDLMdata
+            // directly, so the echo was written even when DLMdata was later set to null.
             appendLog("MIDNIGHT_SEL_EX: " + e.getMessage() + " — falling back to full buffer read");
+            StringBuilder exFallbackSb = new StringBuilder();
             DLMdata = this.GetParameter_LS(port, (byte) 7, "0100630200FF", (byte) 2,
-                    this.bytWait, this.bytTryCnt, this.bytTimOut, true, strbldDLMdata);
+                    this.bytWait, this.bytTryCnt, this.bytTimOut, true, exFallbackSb);
+            if (hasMeaningfulDlmsPayload(DLMdata)) {
+                String[] _exMp = DLMdata.toString().trim().split("\\s+");
+                String _exMpx = _exMp.length >= 4 ? _exMp[_exMp.length - 1].toUpperCase() : "";
+                if (_exMpx.length() == 10 && _exMpx.startsWith("06")) {
+                    appendLog("MIDNIGHT_EX_SCALAR: uint32 echo 0x" + _exMpx.substring(2)
+                            + " — Genus LP2 EX-fallback also returns EIU as scalar, discarding");
+                    DLMdata = null;
+                    // exFallbackSb discarded — echo never reaches strbldDLMdata
+                } else {
+                    strbldDLMdata.append(exFallbackSb);
+                    // Mark as handled: prevents the hasMeaningfulDlmsPayload block below
+                    // from double-appending DLMdata to strbldDLMdata.
+                    DLMdata = null;
+                }
+            }
         }
         // V30 FIX: Genus LP2 anomaly — some Genus firmware echoes entries_in_use as a
         // uint32 scalar (DLMS tag 0x06, 5 bytes total = 10 hex chars) instead of returning
@@ -9893,12 +9918,29 @@ public class ReadingSDK {
         if (hasMeaningfulDlmsPayload(DLMdata))
             strbldDLMdata.append(DLMdata);
         else {
-            // Fall back to full buffer read if selective access returns empty or was discarded
+            // Fall back to full buffer read if selective access returns empty or was discarded.
+            // BUG-FIX V31: use a separate StringBuilder (lsFallbackSb) so the echo-detection
+            // guard below can discard the response BEFORE it reaches strbldDLMdata.
+            // The old V30 code passed strbldDLMdata directly, causing the echo to be written
+            // into the TXT even when DLMdata was later set to null.
             appendLog("MIDNIGHT_SEL_EMPTY — retrying with full buffer read");
+            StringBuilder lsFallbackSb = new StringBuilder();
             DLMdata = this.GetParameter_LS(port, (byte) 7, "0100630200FF", (byte) 2,
-                    this.bytWait, this.bytTryCnt, this.bytTimOut, true, strbldDLMdata);
-            if (hasMeaningfulDlmsPayload(DLMdata))
-                strbldDLMdata.append(DLMdata);
+                    this.bytWait, this.bytTryCnt, this.bytTimOut, true, lsFallbackSb);
+            // V30 FIX: apply same uint32-echo guard to LS fallback result.
+            // Genus firmware echoes entries_in_use as uint32 on BOTH selective and LS.
+            if (hasMeaningfulDlmsPayload(DLMdata)) {
+                String[] _mpLs = DLMdata.toString().trim().split("\\s+");
+                String _mpxLs = _mpLs[_mpLs.length - 1].toUpperCase();
+                if (_mpxLs.length() == 10 && _mpxLs.startsWith("06")) {
+                    appendLog("MIDNIGHT_LS_SCALAR: uint32 echo 0x" + _mpxLs.substring(2)
+                            + " — Genus LP2 LS-fallback also returns EIU as scalar, discarding");
+                    DLMdata = null;
+                    // lsFallbackSb is discarded — echo never reaches strbldDLMdata
+                } else {
+                    strbldDLMdata.append(lsFallbackSb);
+                }
+            }
         }
 
         // BUG-11 FIX: cross-check EIU vs actual buffer result
