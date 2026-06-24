@@ -186,7 +186,8 @@ public class ReadingSDK {
     // PUBLIC API
     // =====================================================================
     public void startReading(MeterMake meterMake, ReadingMode readingMode,
-                             String fileName, ReadingCallback callback) {
+                             String fileName, String userIdWithName, String userRole,
+                             ReadingCallback callback) {
         if (currentFuture != null && !currentFuture.isDone()) {
             fireError(callback, "A reading is already in progress. Call abort() first.");
             return;
@@ -198,8 +199,11 @@ public class ReadingSDK {
         currentMeterMake = meterMake;
         final String finalFileName = (fileName != null && !fileName.trim().isEmpty())
                 ? fileName.trim() : "SDK_READ";
+        final String finalUserIdWithName = (userIdWithName != null) ? userIdWithName : "";
+        final String finalUserRole = (userRole != null) ? userRole : "";
         currentFuture = executor.submit(
-                () -> runReading(meterMake, readingMode, finalFileName, callback));
+                () -> runReading(meterMake, readingMode, finalFileName,
+                        finalUserIdWithName, finalUserRole, callback));
     }
 
     public void abort() {
@@ -288,7 +292,8 @@ public class ReadingSDK {
     // All DLMS logic unchanged — only UI/AsyncTask wrapper removed.
     // =====================================================================
     private void runReading(MeterMake meterMake, ReadingMode readingMode,
-                            String baseFileName, ReadingCallback callback) {
+                            String baseFileName, String userIdWithName, String userRole,
+                            ReadingCallback callback) {
         String CescRajMeterno = "PENDING";
         String dlmsPassword = meterMake.getPassword();
         int lsDays = 35;
@@ -426,7 +431,8 @@ public class ReadingSDK {
                 if (manufacturerStr.isEmpty()) {
                     manufacturerStr = currentMeterMake.getDisplayName();
                 }
-                String fileHeader = "MANUFACTURER=" + manufacturerStr + "\r\nMETERNO=" + MeterNo + "\r\n";
+                String fileHeader = "MANUFACTURER=" + manufacturerStr + "\r\nMETERNO=" + MeterNo + "\r\n" ;
+                fileHeader += "USERIDWITHNAME=" + userIdWithName + "\r\nUSERROLE=" + userRole + "\r\n";
                 String currentGpsLocation = GetLocation();
                 if (!currentGpsLocation.isEmpty() && currentGpsLocation.contains("~")) {
                     String[] gpsParts = currentGpsLocation.split("~", 2);

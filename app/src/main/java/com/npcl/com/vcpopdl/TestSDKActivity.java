@@ -177,7 +177,7 @@ public class TestSDKActivity extends AppCompatActivity {
         final ReadingSDK.ReadingMode finalMode = readingMode;
         final String finalFile = fileName;
 
-        sdk.startReading(finalMake, finalMode, finalFile, new ReadingSDK.ReadingCallback() {
+        sdk.startReading(finalMake, finalMode, finalFile, "", "", new ReadingSDK.ReadingCallback() {
             @Override
             public void onProgress(String message, int progressPercent) {
                 progressBar.setProgress(progressPercent);
