@@ -4099,6 +4099,7 @@ public class ReadingSDK {
                     .format(new Date());
             long oneDayMs = 24L * 60 * 60 * 1000;
             long cutoff   = System.currentTimeMillis() - oneDayMs;
+            String userTag = sanitizeForFileName(userIdWithName);
 
             // Purge files older than 1 day and find highest session index for today
             int maxIdx = 0;
@@ -4109,11 +4110,12 @@ public class ReadingSDK {
                     if (!name.startsWith(LOG_PREFIX) || !name.endsWith(LOG_SUFFIX)) continue;
                     // Check if this file belongs to today
                     if (name.contains(todayDate)) {
-                        // Extract session index from name: CescRaj_OPTICAL_LOG_YYYYMMDD_N.TXT
+                        // Extract trailing session index: SDK_OPTICAL_LOG_[user_]YYYYMMDD_N.TXT
                         try {
-                            String[] parts = name.replace(LOG_PREFIX, "").replace(LOG_SUFFIX, "").split("_");
-                            if (parts.length == 2) {
-                                int idx = Integer.parseInt(parts[1]);
+                            String core = name.substring(LOG_PREFIX.length(), name.length() - LOG_SUFFIX.length());
+                            int lastUnderscore = core.lastIndexOf('_');
+                            if (lastUnderscore >= 0) {
+                                int idx = Integer.parseInt(core.substring(lastUnderscore + 1));
                                 if (idx > maxIdx) maxIdx = idx;
                             }
                         } catch (Exception ignored) {}
@@ -4124,9 +4126,11 @@ public class ReadingSDK {
                 }
             }
 
-            // Create new session file: CescRaj_OPTICAL_LOG_YYYYMMDD_(N+1).TXT
+            // Create new session file: SDK_OPTICAL_LOG_[user_]YYYYMMDD_(N+1).TXT
             int sessionIdx = maxIdx + 1;
-            String fileName = LOG_PREFIX + todayDate + "_" + sessionIdx + LOG_SUFFIX;
+            String fileName = LOG_PREFIX
+                    + (userTag.isEmpty() ? "" : userTag + "_")
+                    + todayDate + "_" + sessionIdx + LOG_SUFFIX;
             File logFile = new File(logDir, fileName);
             currentLogPath = logFile.getAbsolutePath();
 
@@ -4151,6 +4155,15 @@ public class ReadingSDK {
             // If log setup fails, log to a fallback path and continue
             currentLogPath = null;
         }
+    }
+
+    // Strips characters unsafe for filenames and caps length so the user id/name
+    // can be embedded directly in the SDK_OPTICAL_LOG_*.TXT filename.
+    private String sanitizeForFileName(String s) {
+        if (s == null) return "";
+        String cleaned = s.trim().replaceAll("[^A-Za-z0-9]+", "_").replaceAll("^_+|_+$", "");
+        if (cleaned.length() > 24) cleaned = cleaned.substring(0, 24);
+        return cleaned;
     }
 
     /**
