@@ -299,7 +299,7 @@ public class ReadingSDK {
         int lsDays = 35;
         StringBuilder lastMeterData = null;
         try {
-            startDiagLog(meterMake.getDisplayName(), readingMode.getDisplayName(), lsDays);
+            startDiagLog(meterMake.getDisplayName(), readingMode.getDisplayName(), lsDays, userIdWithName, userRole);
             appendLog("=== runReading START mode=" + readingMode.getDisplayName() + " ===");
             fireProgress(callback, "Starting reading — " + readingMode.getDisplayName(), 5);
 
@@ -4080,7 +4080,8 @@ public class ReadingSDK {
      * @param modeLabel       reading mode (e.g. "Complete", "Instant")
      * @param lpDays          number of LP days requested (0 if not applicable)
      */
-    private void startDiagLog(String meterMakeLabel, String modeLabel, int lpDays) {
+    private void startDiagLog(String meterMakeLabel, String modeLabel, int lpDays,
+                              String userIdWithName, String userRole) {
         logBuffer.setLength(0);
         logLineCount = 0;
 
@@ -4139,6 +4140,8 @@ public class ReadingSDK {
                     + " | Make=" + meterMakeLabel
                     + " | Mode=" + modeLabel
                     + (lpDays > 0 ? " | Days=" + lpDays : "")
+                    + " | User=" + (userIdWithName != null ? userIdWithName : "")
+                    + " | Role=" + (userRole != null ? userRole : "")
                     + " | bytTimOut=" + bytTimOut
                     + " bytTryCnt=" + bytTryCnt + "\r\n");
             bw.write("==============================\r\n");
