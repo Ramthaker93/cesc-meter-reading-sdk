@@ -570,11 +570,11 @@ public class ReadingSDK {
                         // indefinitely forcing the user to manually abort.
                         // 420s = 7 min = safe ceiling: fastest meters finish in 2-3 min,
                         // slowest 35-day 15-min LP (3360 records) typically takes 5-6 min.
-                        // Phase budgets within the 420s cap:
+                        // Phase budgets within the 420s cap (order: Inst→Mid→LP→Bill→Evt):
                         //   Instantaneous : up to  60s (typically 20-30s with Fixes A+B)
-                        //   Billing       : up to  60s (typically  5-20s)
                         //   Midnight LP   : up to  20s (typically  2- 5s)
-                        //   Block LP      : remaining time minus 30s events buffer
+                        //   Block LP      : remaining time minus 90s (billing+events) buffer
+                        //   Billing       : up to  60s (typically  5-20s)
                         //   Events        : up to  30s (typically 10-20s)
                         //   Total         : guaranteed ≤ 420s regardless of meter behaviour
                         long sessionStartMs = System.currentTimeMillis();
@@ -617,108 +617,109 @@ public class ReadingSDK {
                         fireProgress(callback, "✓ Instantaneous done (" + (tInstElapsed/1000) + "s)", 38);
                         UpdateStatus(CescRajMeterno, "Instantaneous OK");
 
-                        // ── Phase 2: Billing ─────────────────────────────────────────────
-                        // Skip if session deadline already exceeded (very slow instant phase)
+                        // ── Phase 2: Midnight Snapshot ────────────────────────────────────
+                        // READ BEFORE BILLING: Genus LC001 firmware's profile-generic COSEM
+                        // buffer object becomes unresponsive after billing's 25 block-transfers.
+                        // DISC+SNRM+AARQ (REASSOC_POST_BILLING) is insufficient to reset the
+                        // firmware's internal LP/midnight buffer tracking state.  Reading these
+                        // phases in clean COSEM state (before billing) matches the original
+                        // pre-optimization MRI reading order which correctly returns 4297 records.
                         if (System.currentTimeMillis() >= sessionDeadlineMs) {
-                            appendLog("SESSION_SKIP_BILLING: session deadline reached after Instantaneous");
-                            fireProgress(callback, "WARN: Session limit reached — skipping Billing+LP+Events", 79);
+                            appendLog("SESSION_SKIP_MIDNIGHT: session deadline reached after Instantaneous");
+                            fireProgress(callback, "WARN: Session limit reached — skipping Midnight+LP+Billing+Events", 79);
                         } else {
-                            bytTimOut = billingTimOut;
-                            bytTryCnt = billingTryCnt;
-                            drainPort(port);
-                            android.os.SystemClock.sleep(150);
-                            long tBillStart = System.currentTimeMillis();
-                            fireProgress(callback, "Downloading Billing data... (15-30s)", 40);
-                            StringBuilder billingData = ReadBillingData(port, readingMode);
-                            MeterData.append(billingData);
-                            long tBillElapsed = System.currentTimeMillis() - tBillStart;
-                            appendLog("BILLING_DONE elapsed=" + tBillElapsed + "ms");
-                            flushLog(); // V29: flush so billing logs appear in file even if LP is slow
-                            if (billingData != null && billingData.length() > 0) {
-                                fireProgress(callback, "✓ Billing done (" + (tBillElapsed/1000) + "s)", 50);
-                                UpdateStatus(CescRajMeterno, "Billing OK");
+                            bytTimOut = fastTimOut;
+                            bytTryCnt = fastTryCnt;
+                            long tMidStart = System.currentTimeMillis();
+                            fireProgress(callback, "Downloading Midnight Snapshot... (5-10s)", 40);
+                            MeterData.append(ReadMidnightSnapshot(port, lsDays));
+                            long tMidElapsed = System.currentTimeMillis() - tMidStart;
+                            fireProgress(callback, "✓ Midnight done (" + (tMidElapsed/1000) + "s)", 46);
+                            UpdateStatus(CescRajMeterno, "Midnight OK");
+                            flushLog();
+
+                            // ── Phase 3: Load Profile ─────────────────────────────────────
+                            // READ BEFORE BILLING — same reason as midnight above.
+                            // Reserve 90s for billing (up to 60s) + events (30s) buffer.
+                            // Floor at 60s: if we have less than 60s left, LP is skipped.
+                            // Hard cap at 300s (5 min) to leave billing+events headroom.
+                            long lpRemaining = sessionDeadlineMs - System.currentTimeMillis() - 90000L;
+                            if (lpRemaining < 60000L) {
+                                appendLog("SESSION_SKIP_LP: only " + (lpRemaining/1000) + "s remaining — insufficient for LP");
+                                fireProgress(callback, "WARN: ⚠ Insufficient time for Load Profile — skipping", 50);
                             } else {
-                                fireProgress(callback, "WARN: Billing empty — check meter (" + (tBillElapsed/1000) + "s)", 50);
-                                appendLog("BILLING_WARN: Billing section empty in COMPLETE mode");
-                                UpdateStatus(CescRajMeterno, "Billing FAILED");
+                                long lpBudgetMs = Math.min(lpRemaining, 300000L); // cap at 5 min
+                                bytTimOut = (byte) 8;
+                                bytTryCnt = (byte) 2;
+                                lpDeadlineMs = System.currentTimeMillis() + lpBudgetMs;
+                                long lpStartMs = System.currentTimeMillis();
+                                int lpBudgetSec = (int)(lpBudgetMs / 1000);
+                                fireProgress(callback, "Downloading Load Profile... (up to " + lpBudgetSec + "s)", 48);
+                                appendLog("LP_START days=auto bytTimOut=" + bytTimOut
+                                        + " bytTryCnt=" + bytTryCnt + " deadline=" + lpBudgetSec + "s");
+                                MeterData.append(ReadLoadSurveyData(port, lsDays));
+                                long lpElapsed = System.currentTimeMillis() - lpStartMs;
+                                boolean lpDeadlineHit = lpDeadlineMs > 0 && System.currentTimeMillis() > lpDeadlineMs;
+                                appendLog("LP_END elapsed=" + lpElapsed + "ms dataLen=" + MeterData.length()
+                                        + " deadlineHit=" + lpDeadlineHit);
+                                int lpPct = 48 + (int)(Math.min(lpElapsed, lpBudgetMs) * 16L / Math.max(lpBudgetMs, 1L));
+                                fireProgress(callback, "✓ Load Profile done (" + (lpElapsed/1000) + "s / " + lpBudgetSec + "s budget)",
+                                        Math.min(lpPct, 64));
+                                flushLog();
+                                lpDeadlineMs = 0;
                             }
 
-                            // ── REASSOC after billing ─────────────────────────────────────
-                            // ROOT CAUSE (Genus LC001 + any make with 25+ billing blocks):
-                            // Billing block-transfers leave the firmware's profile-generic
-                            // COSEM buffer in an "active/pending" state.  Subsequent reads
-                            // on midnight (0100630200FF) and LP (0100630100FF) attr=2 return
-                            // the EIU as a uint32 scalar echo instead of the actual buffer.
-                            // BUG in previous REASSOC: omitted AddressInit(), so nSentCntr/
-                            // nRecvCntr retained post-billing values.  After DISC+SNRM the
-                            // meter resets its counters to 0 but we sent AARQ with N(S)!=0
-                            // → meter rejected with aarqRes=1.  AddressInit() resets them.
-                            if (!abortRequested && System.currentTimeMillis() < sessionDeadlineMs) {
-                                appendLog("REASSOC_POST_BILLING — resetting COSEM after billing block transfers");
-                                try {
-                                    drainPort(port);
-                                    android.os.SystemClock.sleep(200);
-                                    AddressInit();
-                                    boolean nrmPost = SetNRM(port, bytWait, (byte) 2, bytTimOut);
-                                    if (nrmPost) {
-                                        int aarqPost = AARQ(port, (byte) 1, dlmsPassword,
-                                                bytWait, (byte) 2, bytTimOut);
-                                        appendLog("REASSOC_POST_BILLING_"
-                                                + (aarqPost == 0 ? "OK" : "FAIL aarqRes=" + aarqPost));
-                                        if (aarqPost == 0) drainPort(port);
-                                    } else {
-                                        appendLog("REASSOC_POST_BILLING_NRM_FAIL — midnight/LP may return scalar echoes");
-                                    }
-                                } catch (Exception rpbEx) {
-                                    appendLog("REASSOC_POST_BILLING_EX: " + rpbEx.getMessage());
-                                }
-                            }
-
-                            // ── Phase 3: Midnight Snapshot ───────────────────────────────
+                            // ── Phase 4: Billing ──────────────────────────────────────────
+                            // Moved AFTER midnight+LP so billing's 25 block-transfers cannot
+                            // corrupt the Genus firmware's profile-generic buffer state.
                             if (System.currentTimeMillis() >= sessionDeadlineMs) {
-                                appendLog("SESSION_SKIP_MIDNIGHT: session deadline reached after Billing");
-                                fireProgress(callback, "WARN: Session limit reached — skipping Midnight+LP+Events", 73);
+                                appendLog("SESSION_SKIP_BILLING: session deadline reached after LP");
+                                fireProgress(callback, "WARN: Session limit reached — skipping Billing+Events", 79);
                             } else {
-                                bytTimOut = fastTimOut;
-                                bytTryCnt = fastTryCnt;
-                                long tMidStart = System.currentTimeMillis();
-                                fireProgress(callback, "Downloading Midnight Snapshot... (5-10s)", 52);
-                                MeterData.append(ReadMidnightSnapshot(port, lsDays));
-                                long tMidElapsed = System.currentTimeMillis() - tMidStart;
-                                fireProgress(callback, "✓ Midnight done (" + (tMidElapsed/1000) + "s)", 58);
-                                UpdateStatus(CescRajMeterno, "Midnight OK");
-                                flushLog(); // V29: flush before LP so midnight logs are on disk
-
-                                // ── Phase 4: Load Profile ─────────────────────────────────
-                                // LP budget = remaining session time minus 30s events buffer.
-                                // Hard cap at 360s (6 min) so a very fast pre-LP sequence
-                                // doesn't give LP the entire 7 min, leaving no room for events.
-                                // Floor at 60s: if we have less than 60s left, LP is skipped
-                                // entirely (cannot do a meaningful LP read in under 60s).
-                                long lpRemaining = sessionDeadlineMs - System.currentTimeMillis() - 30000L;
-                                if (lpRemaining < 60000L) {
-                                    appendLog("SESSION_SKIP_LP: only " + (lpRemaining/1000) + "s remaining — insufficient for LP");
-                                    fireProgress(callback, "WARN: ⚠ Insufficient time for Load Profile — skipping", 73);
+                                bytTimOut = billingTimOut;
+                                bytTryCnt = billingTryCnt;
+                                drainPort(port);
+                                android.os.SystemClock.sleep(150);
+                                long tBillStart = System.currentTimeMillis();
+                                fireProgress(callback, "Downloading Billing data... (15-30s)", 66);
+                                StringBuilder billingData = ReadBillingData(port, readingMode);
+                                MeterData.append(billingData);
+                                long tBillElapsed = System.currentTimeMillis() - tBillStart;
+                                appendLog("BILLING_DONE elapsed=" + tBillElapsed + "ms");
+                                flushLog();
+                                if (billingData != null && billingData.length() > 0) {
+                                    fireProgress(callback, "✓ Billing done (" + (tBillElapsed/1000) + "s)", 72);
+                                    UpdateStatus(CescRajMeterno, "Billing OK");
                                 } else {
-                                    long lpBudgetMs = Math.min(lpRemaining, 360000L); // cap at 6 min
-                                    bytTimOut = (byte) 8;
-                                    bytTryCnt = (byte) 2;
-                                    lpDeadlineMs = System.currentTimeMillis() + lpBudgetMs;
-                                    long lpStartMs = System.currentTimeMillis();
-                                    int lpBudgetSec = (int)(lpBudgetMs / 1000);
-                                    fireProgress(callback, "Downloading Load Profile... (up to " + lpBudgetSec + "s)", 60);
-                                    appendLog("LP_START days=auto bytTimOut=" + bytTimOut
-                                            + " bytTryCnt=" + bytTryCnt + " deadline=" + lpBudgetSec + "s");
-                                    MeterData.append(ReadLoadSurveyData(port, lsDays));
-                                    long lpElapsed = System.currentTimeMillis() - lpStartMs;
-                                    boolean lpDeadlineHit = lpDeadlineMs > 0 && System.currentTimeMillis() > lpDeadlineMs;
-                                    appendLog("LP_END elapsed=" + lpElapsed + "ms dataLen=" + MeterData.length()
-                                            + " deadlineHit=" + lpDeadlineHit);
-                                    int lpPct = 60 + (int)(Math.min(lpElapsed, lpBudgetMs) * 13L / Math.max(lpBudgetMs, 1L));
-                                    fireProgress(callback, "✓ Load Profile done (" + (lpElapsed/1000) + "s / " + lpBudgetSec + "s budget)",
-                                            Math.min(lpPct, 73));
-                                    flushLog();
-                                    lpDeadlineMs = 0;
+                                    fireProgress(callback, "WARN: Billing empty — check meter (" + (tBillElapsed/1000) + "s)", 72);
+                                    appendLog("BILLING_WARN: Billing section empty in COMPLETE mode");
+                                    UpdateStatus(CescRajMeterno, "Billing FAILED");
+                                }
+
+                                // ── REASSOC after billing / before events ─────────────────
+                                // Billing's block-transfers exhaust the COSEM session state.
+                                // Re-establish association before events (previously two separate
+                                // REASSOC blocks — REASSOC_POST_BILLING and REASSOC-before-events
+                                // — now merged into one at the correct position).
+                                if (!abortRequested && System.currentTimeMillis() < sessionDeadlineMs) {
+                                    appendLog("REASSOC_PRE_EVENTS — resetting COSEM after billing block transfers");
+                                    try {
+                                        drainPort(port);
+                                        android.os.SystemClock.sleep(200);
+                                        AddressInit();
+                                        boolean nrmPre = SetNRM(port, bytWait, (byte) 2, bytTimOut);
+                                        if (nrmPre) {
+                                            int aarqPre = AARQ(port, (byte) 1, dlmsPassword,
+                                                    bytWait, (byte) 2, bytTimOut);
+                                            appendLog("REASSOC_PRE_EVENTS_"
+                                                    + (aarqPre == 0 ? "OK" : "FAIL aarqRes=" + aarqPre));
+                                            if (aarqPre == 0) drainPort(port);
+                                        } else {
+                                            appendLog("REASSOC_PRE_EVENTS_NRM_FAIL — events may be incomplete");
+                                        }
+                                    } catch (Exception rpbEx) {
+                                        appendLog("REASSOC_PRE_EVENTS_EX: " + rpbEx.getMessage());
+                                    }
                                 }
 
                                 // ── Phase 5: Events ───────────────────────────────────────
@@ -726,46 +727,6 @@ public class ReadingSDK {
                                     appendLog("SESSION_SKIP_EVENTS: session deadline reached — skipping events");
                                     fireProgress(callback, "WARN: ⚠ Session limit reached — Events skipped", 79);
                                 } else {
-                                    // FIX: Re-establish COSEM association before reading events.
-                                    // ROOT CAUSE (confirmed 2026-05-16 SS09096791):
-                                    // After a large LP block transfer (e.g. 765 records = 30KB),
-                                    // the Secure meter's COSEM application association is exhausted.
-                                    // Subsequent GetRequest calls return empty COSEM frames regardless
-                                    // of the OBIS requested — even OBIS that returned data earlier
-                                    // in the same session (e.g. 00005E5B0AFF returned 262 bytes
-                                    // during NamePlate but empty during EventData after LP).
-                                    // PROOF: SS09118696 (same make) had LP EIU=0 (no block transfer)
-                                    // and events returned OK in 46ms each. SS09096791 with 30KB LP
-                                    // had all event attrs return empty immediately after LP.
-                                    // FIX: Send DISC+SNRM+AARQ to re-open the association.
-                                    // Cost: ~1-2s. Benefit: all event data recovered.
-                                    // Safe for all makes: harmless if association is still alive.
-                                    // V27: Skip REASSOC entirely if port already died (SEND_FAIL_ABORT
-                                    // set abortRequested=true during LP). SetNRM on a dead port wastes
-                                    // ~8s (2 tries x 4s timeout) before failing. ReadEventData below
-                                    // already handles abortRequested via EVENT_LOOP_ABORT.
-                                    boolean reAssocOk = false;
-                                    if (!abortRequested) {
-                                    appendLog("REASSOC_START — re-establishing COSEM association before events");
-                                    try {
-                                        drainPort(port);
-                                        android.os.SystemClock.sleep(200);
-                                        AddressInit(); // reset nSentCntr/nRecvCntr to 0 — AARQ N(S) must be 0 after SNRM
-                                        boolean nrmOk2 = SetNRM(port, bytWait, (byte) 2, bytTimOut);
-                                        if (nrmOk2) {
-                                            int aarqRes2 = AARQ(port, (byte) 1, dlmsPassword,
-                                                    bytWait, (byte) 2, bytTimOut);
-                                            reAssocOk = (aarqRes2 == 0);
-                                            appendLog("REASSOC_" + (reAssocOk ? "OK" : "AARQ_FAIL aarqRes=" + aarqRes2));
-                                        } else {
-                                            appendLog("REASSOC_NRM_FAIL — events may be incomplete");
-                                        }
-                                    } catch (Exception reEx) {
-                                        appendLog("REASSOC_EX: " + reEx.getMessage());
-                                    }
-                                    } else {
-                                        appendLog("REASSOC_SKIPPED — abortRequested=true (port dead), skipping re-association");
-                                    }
                                     bytTimOut = fastTimOut;
                                     bytTryCnt = fastTryCnt;
                                     long tEvtStart = System.currentTimeMillis();
@@ -774,8 +735,8 @@ public class ReadingSDK {
                                     long tEvtElapsed = System.currentTimeMillis() - tEvtStart;
                                     fireProgress(callback, "✓ Events done (" + (tEvtElapsed/1000) + "s)", 79);
                                 }
-                            } // end Midnight+LP+Events
-                        } // end Billing+Midnight+LP+Events
+                            } // end Billing+Events
+                        } // end Midnight+LP+Billing+Events
 
                         // ── Session summary ──────────────────────────────────────────────
                         long sessionElapsed = System.currentTimeMillis() - sessionStartMs;
