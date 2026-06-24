@@ -233,8 +233,41 @@ public class ReadingSDK {
     private void UpdateStatusFileNme(String meterNo, String fileName) {
         appendLog("FILE: " + meterNo + " — " + fileName);
     }
-    // GPS not available in SDK
-    private String GetLocation() { return ""; }
+    // GPS — read directly via Android LocationManager. metersdk has no Activity/UI
+    // context of its own (GPSTracker lives in :app and isn't visible to this module),
+    // so this reads the last-known fix straight from the system service instead.
+    // Returns "" (non-fatal) if permission isn't granted or no provider has a fix yet —
+    // the caller already treats an empty result as "no GPS available", same as Reading.java.
+    private String GetLocation() {
+        String myLoc = "";
+        try {
+            if (androidx.core.content.ContextCompat.checkSelfPermission(context,
+                    android.Manifest.permission.ACCESS_FINE_LOCATION) != android.content.pm.PackageManager.PERMISSION_GRANTED
+                    && androidx.core.content.ContextCompat.checkSelfPermission(context,
+                    android.Manifest.permission.ACCESS_COARSE_LOCATION) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                appendLog("GPS_PERMISSION_DENIED — lat/long not captured");
+                return myLoc;
+            }
+            android.location.LocationManager lm =
+                    (android.location.LocationManager) context.getSystemService(Context.LOCATION_SERVICE);
+            if (lm == null) return myLoc;
+            android.location.Location location = null;
+            if (lm.isProviderEnabled(android.location.LocationManager.NETWORK_PROVIDER)) {
+                location = lm.getLastKnownLocation(android.location.LocationManager.NETWORK_PROVIDER);
+            }
+            if (location == null && lm.isProviderEnabled(android.location.LocationManager.GPS_PROVIDER)) {
+                location = lm.getLastKnownLocation(android.location.LocationManager.GPS_PROVIDER);
+            }
+            if (location != null) {
+                myLoc = Double.toString(location.getLatitude()) + "~" + Double.toString(location.getLongitude());
+            } else {
+                appendLog("GPS_NO_FIX — no last-known location from network or GPS provider");
+            }
+        } catch (Exception ex) {
+            appendLog("GPS_ERROR: " + ex.getMessage());
+        }
+        return myLoc;
+    }
 
 
     // =====================================================================
@@ -381,6 +414,11 @@ public class ReadingSDK {
                     manufacturerStr = currentMeterMake.getDisplayName();
                 }
                 String fileHeader = "MANUFACTURER=" + manufacturerStr + "\r\nMETERNO=" + MeterNo + "\r\n";
+                String currentGpsLocation = GetLocation();
+                if (!currentGpsLocation.isEmpty() && currentGpsLocation.contains("~")) {
+                    String[] gpsParts = currentGpsLocation.split("~", 2);
+                    fileHeader += "LATITUDE=" + gpsParts[0].trim() + "\r\nLONGITUDE=" + gpsParts[1].trim() + "\r\n";
+                }
 
                 // ============================================================
                 // RTC CHECK — FLAG AND CONTINUE (does NOT abort reading)
