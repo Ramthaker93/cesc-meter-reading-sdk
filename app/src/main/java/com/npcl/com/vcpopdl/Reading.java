@@ -976,6 +976,7 @@ public class Reading extends AppCompatActivity {
                     manufacturerStr = currentMeterMake.getDisplayName();
                 }
                 String fileHeader = "MANUFACTURER=" + manufacturerStr + "\r\nMETERNO=" + MeterNo + "\r\n";
+                fileHeader += "USERIDWITHNAME=" + BYPASS_USER_ID + "\r\nUSERROLE=" + BYPASS_ROLE + "\r\n";
 
                 // ============================================================
                 // RTC CHECK — FLAG AND CONTINUE (does NOT abort reading)
