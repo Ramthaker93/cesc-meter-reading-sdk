@@ -4100,6 +4100,7 @@ public class ReadingSDK {
             long oneDayMs = 24L * 60 * 60 * 1000;
             long cutoff   = System.currentTimeMillis() - oneDayMs;
             String userTag = sanitizeForFileName(userIdWithName);
+            String roleTag = sanitizeForFileName(userRole);
 
             // Purge files older than 1 day and find highest session index for today
             int maxIdx = 0;
@@ -4126,10 +4127,11 @@ public class ReadingSDK {
                 }
             }
 
-            // Create new session file: SDK_OPTICAL_LOG_[user_]YYYYMMDD_(N+1).TXT
+            // Create new session file: SDK_OPTICAL_LOG_[user_][role_]YYYYMMDD_(N+1).TXT
             int sessionIdx = maxIdx + 1;
             String fileName = LOG_PREFIX
                     + (userTag.isEmpty() ? "" : userTag + "_")
+                    + (roleTag.isEmpty() ? "" : roleTag + "_")
                     + todayDate + "_" + sessionIdx + LOG_SUFFIX;
             File logFile = new File(logDir, fileName);
             currentLogPath = logFile.getAbsolutePath();
