@@ -643,6 +643,37 @@ public class ReadingSDK {
                                 UpdateStatus(CescRajMeterno, "Billing FAILED");
                             }
 
+                            // ── REASSOC after billing ─────────────────────────────────────
+                            // ROOT CAUSE (Genus LC001 + any make with 25+ billing blocks):
+                            // Billing block-transfers leave the firmware's profile-generic
+                            // COSEM buffer in an "active/pending" state.  Subsequent reads
+                            // on midnight (0100630200FF) and LP (0100630100FF) attr=2 return
+                            // the EIU as a uint32 scalar echo instead of the actual buffer.
+                            // BUG in previous REASSOC: omitted AddressInit(), so nSentCntr/
+                            // nRecvCntr retained post-billing values.  After DISC+SNRM the
+                            // meter resets its counters to 0 but we sent AARQ with N(S)!=0
+                            // → meter rejected with aarqRes=1.  AddressInit() resets them.
+                            if (!abortRequested && System.currentTimeMillis() < sessionDeadlineMs) {
+                                appendLog("REASSOC_POST_BILLING — resetting COSEM after billing block transfers");
+                                try {
+                                    drainPort(port);
+                                    android.os.SystemClock.sleep(200);
+                                    AddressInit();
+                                    boolean nrmPost = SetNRM(port, bytWait, (byte) 2, bytTimOut);
+                                    if (nrmPost) {
+                                        int aarqPost = AARQ(port, (byte) 1, dlmsPassword,
+                                                bytWait, (byte) 2, bytTimOut);
+                                        appendLog("REASSOC_POST_BILLING_"
+                                                + (aarqPost == 0 ? "OK" : "FAIL aarqRes=" + aarqPost));
+                                        if (aarqPost == 0) drainPort(port);
+                                    } else {
+                                        appendLog("REASSOC_POST_BILLING_NRM_FAIL — midnight/LP may return scalar echoes");
+                                    }
+                                } catch (Exception rpbEx) {
+                                    appendLog("REASSOC_POST_BILLING_EX: " + rpbEx.getMessage());
+                                }
+                            }
+
                             // ── Phase 3: Midnight Snapshot ───────────────────────────────
                             if (System.currentTimeMillis() >= sessionDeadlineMs) {
                                 appendLog("SESSION_SKIP_MIDNIGHT: session deadline reached after Billing");
@@ -719,6 +750,7 @@ public class ReadingSDK {
                                     try {
                                         drainPort(port);
                                         android.os.SystemClock.sleep(200);
+                                        AddressInit(); // reset nSentCntr/nRecvCntr to 0 — AARQ N(S) must be 0 after SNRM
                                         boolean nrmOk2 = SetNRM(port, bytWait, (byte) 2, bytTimOut);
                                         if (nrmOk2) {
                                             int aarqRes2 = AARQ(port, (byte) 1, dlmsPassword,

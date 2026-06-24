@@ -1,3 +1,4 @@
+// VERSION: V35 — REASSOC fix: (1) add AddressInit() before SetNRM() in REASSOC-before-events so I-frame counters reset to 0 after DISC+SNRM (meter was rejecting AARQ with aarqRes=1 because our N(S)!=0 after billing block transfers); (2) add post-billing REASSOC to reset Genus LC001 firmware profile-generic COSEM buffer that stays "active" after 25 billing block transfers (causes midnight/LP attr=2 to return EIU as scalar echo instead of actual buffer) (2026-06-24)
 // VERSION: V34 — GetLocation: replaced GPSTracker with direct LocationManager (GPS→Network→Passive fallback); fixes missing LATITUDE/LONGITUDE in TXT header when getLastKnownLocation() returned null despite GPS on (2026-06-24)
 // VERSION: V33 — ReadEventData: session deadline checked per OBIS iteration so event loop cannot overrun SESSION_MAX_SECONDS (2026-06-23)
 // VERSION: V32 — Empty-payload guard: hasMeaningfulDlmsPayload now returns false when parts<4 (catches L&T LP2 empty response that triggered wrong true); LP2 exception-path LS fallback now also uses exFallbackSb (same echo-leak fix as V31 empty-path); dlms-converter: SS=0xFF→00, L&G LP2 outer-wrapper strip (2026-06-23)
@@ -1182,6 +1183,37 @@ public class Reading extends AppCompatActivity {
                                 UpdateStatus(CescRajMeterno, "Billing FAILED");
                             }
 
+                            // ── REASSOC after billing ─────────────────────────────────────
+                            // ROOT CAUSE (Genus LC001 + any make with 25+ billing blocks):
+                            // Billing block-transfers leave the firmware's profile-generic
+                            // COSEM buffer in an "active/pending" state.  Subsequent reads
+                            // on midnight (0100630200FF) and LP (0100630100FF) attr=2 return
+                            // the EIU as a uint32 scalar echo instead of the actual buffer.
+                            // BUG in previous REASSOC: omitted AddressInit(), so nSentCntr/
+                            // nRecvCntr retained post-billing values.  After DISC+SNRM the
+                            // meter resets its counters to 0 but we sent AARQ with N(S)!=0
+                            // → meter rejected with aarqRes=1.  AddressInit() resets them.
+                            if (!abortRequested && System.currentTimeMillis() < sessionDeadlineMs) {
+                                appendLog("REASSOC_POST_BILLING — resetting COSEM after billing block transfers");
+                                try {
+                                    drainPort(port);
+                                    android.os.SystemClock.sleep(200);
+                                    AddressInit();
+                                    boolean nrmPost = SetNRM(port, bytWait, (byte) 2, bytTimOut);
+                                    if (nrmPost) {
+                                        int aarqPost = AARQ(port, (byte) 1, dlmsPassword,
+                                                bytWait, (byte) 2, bytTimOut);
+                                        appendLog("REASSOC_POST_BILLING_"
+                                                + (aarqPost == 0 ? "OK" : "FAIL aarqRes=" + aarqPost));
+                                        if (aarqPost == 0) drainPort(port);
+                                    } else {
+                                        appendLog("REASSOC_POST_BILLING_NRM_FAIL — midnight/LP may return scalar echoes");
+                                    }
+                                } catch (Exception rpbEx) {
+                                    appendLog("REASSOC_POST_BILLING_EX: " + rpbEx.getMessage());
+                                }
+                            }
+
                             // ── Phase 3: Midnight Snapshot ───────────────────────────────
                             if (System.currentTimeMillis() >= sessionDeadlineMs) {
                                 appendLog("SESSION_SKIP_MIDNIGHT: session deadline reached after Billing");
@@ -1258,6 +1290,7 @@ public class Reading extends AppCompatActivity {
                                     try {
                                         drainPort(port);
                                         android.os.SystemClock.sleep(200);
+                                        AddressInit(); // reset nSentCntr/nRecvCntr to 0 — AARQ N(S) must be 0 after SNRM
                                         boolean nrmOk2 = SetNRM(port, bytWait, (byte) 2, bytTimOut);
                                         if (nrmOk2) {
                                             int aarqRes2 = AARQ(port, (byte) 1, dlmsPassword,
