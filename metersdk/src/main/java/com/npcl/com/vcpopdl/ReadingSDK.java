@@ -531,7 +531,13 @@ public class ReadingSDK {
 
                         // FIX B: Use 4s instant timeout (was 3s).
                         // 4s provides safe headroom for all makes including slow optical ports.
-                        byte fastTimOut = (byte) 4;   // 4s: safe headroom for all makes
+                        // FIX: 8s event timeout (was 4s).
+                        // After a large LP block-transfer (e.g. 35 chunks for Genus KT089348),
+                        // the meter needs time to release its event-log buffer. At 4s, attr=7
+                        // and attr=2 timed out consistently while attr=3 (static CO) returned
+                        // immediately. ACCESS_ERROR (unsupported OBIS) is still fast-fail so
+                        // the extra headroom does not add delay for non-matching OBISes.
+                        byte fastTimOut = (byte) 8;   // 8s: covers post-LP meter settle time
                         byte fastTryCnt = (byte) 1;   // 1 attempt: fast-fail covers ACCESS_ERROR
                         // billingTimOut=10s: block transfer on single-phase Secure can be slower
                         byte billingTimOut = (byte) 10;
@@ -8251,6 +8257,12 @@ public class ReadingSDK {
                 appendLog("EVENT_LOOP_ABORT — abortRequested=true, skipping remaining event OBIS");
                 break;
             }
+            // FIX V33: Guard session deadline per iteration so a meter with many populated
+            // event logs cannot push elapsed time past SESSION_MAX_SECONDS uncontrolled.
+            if (sessionDeadlineMs > 0 && System.currentTimeMillis() >= sessionDeadlineMs) {
+                appendLog("EVENT_SESSION_DEADLINE obis=" + obis + " — session limit reached, skipping remaining event OBIS");
+                break;
+            }
             // attr=3: capture objects — if absent this OBIS not supported, skip entirely
             DLMdata = this.GetParameter(port, (byte) 7, obis, (byte) 3,
                     this.bytWait, this.bytTryCnt, this.bytTimOut, true, strbldDLMdata);
@@ -8261,8 +8273,12 @@ public class ReadingSDK {
                     eventCoProbed = true;
                     appendLog("EVENT_CO_PROBE obis=" + obis + " — attr=3 empty, probing attr=2 directly");
                     StringBuilder probeSb = new StringBuilder();
+                    // FIX: isDLM must be true so GetParameter writes the class/OBIS/attr header.
+                    // With isDLM=false the returned SbData has no header and no spaces, so
+                    // hasMeaningfulDlmsPayload (which requires 4 whitespace-separated tokens)
+                    // always returned false — eventCoMissing was never set for any meter.
                     StringBuilder probeDat = this.GetParameter(port, (byte) 7, obis, (byte) 2,
-                            this.bytWait, (byte) 1, this.bytTimOut, false, probeSb);
+                            this.bytWait, (byte) 1, this.bytTimOut, true, probeSb);
                     if (hasMeaningfulDlmsPayload(probeDat)) {
                         String probeHex = probeDat.toString().trim().split("\\s+").length > 3
                                 ? probeDat.toString().trim().split("\\s+")[3] : "";
