@@ -1,3 +1,4 @@
+// VERSION: V34 — GetLocation: replaced GPSTracker with direct LocationManager (GPS→Network→Passive fallback); fixes missing LATITUDE/LONGITUDE in TXT header when getLastKnownLocation() returned null despite GPS on (2026-06-24)
 // VERSION: V33 — ReadEventData: session deadline checked per OBIS iteration so event loop cannot overrun SESSION_MAX_SECONDS (2026-06-23)
 // VERSION: V32 — Empty-payload guard: hasMeaningfulDlmsPayload now returns false when parts<4 (catches L&T LP2 empty response that triggered wrong true); LP2 exception-path LS fallback now also uses exFallbackSb (same echo-leak fix as V31 empty-path); dlms-converter: SS=0xFF→00, L&G LP2 outer-wrapper strip (2026-06-23)
 // VERSION: V31 — LP2 LS-fallback echo leak fix: use lsFallbackSb so echo is discarded before reaching TXT (V30 wrote echo to strbldDLMdata before null-check ran) (2026-06-23)
@@ -66,6 +67,7 @@ import java.util.concurrent.TimeUnit;
 
 import android.app.ProgressDialog;
 import android.os.AsyncTask;
+import android.annotation.SuppressLint;
 
 public class Reading extends AppCompatActivity {
 
@@ -450,21 +452,52 @@ public class Reading extends AppCompatActivity {
     // =====================================================================
     // GPS
     // =====================================================================
+    // Uses LocationManager directly with GPS → Network → Passive fallback chain.
+    // GPSTracker relied on a callback that never fired (no Looper on background
+    // threads, and getLastKnownLocation() returns null when no cached fix exists).
+    // getLastKnownLocation() is instant (no wait); returns null only if the
+    // provider has never produced a fix on this device — in that case we skip.
+    // Filters out (0,0) which indicates an unacquired fix, not a real location.
+    @SuppressLint("MissingPermission")
     public String GetLocation() {
         String MyLoc = "";
         try {
-            GPSTracker gps = new GPSTracker(this);
-            if (gps.canGetLocation()) {
-                double latitude  = gps.getLatitude();
-                double longitude = gps.getLongitude();
-                MyLoc = Double.toString(latitude) + "~" + Double.toString(longitude);
-            } else {
-                gps.showSettingsAlert();
+            android.location.LocationManager lm = (android.location.LocationManager)
+                    getSystemService(android.content.Context.LOCATION_SERVICE);
+            if (lm == null) return MyLoc;
+
+            android.location.Location loc = null;
+
+            String[] providers = {
+                android.location.LocationManager.GPS_PROVIDER,
+                android.location.LocationManager.NETWORK_PROVIDER,
+                android.location.LocationManager.PASSIVE_PROVIDER,
+            };
+            for (String provider : providers) {
+                try {
+                    if (!lm.isProviderEnabled(provider)) continue;
+                    android.location.Location candidate = lm.getLastKnownLocation(provider);
+                    if (candidate == null) continue;
+                    // Skip (0,0) — indicates no real fix
+                    if (candidate.getLatitude() == 0.0 && candidate.getLongitude() == 0.0) continue;
+                    // Prefer the most recent fix
+                    if (loc == null || candidate.getTime() > loc.getTime()) loc = candidate;
+                } catch (Exception ignored) {}
             }
-            return MyLoc;
+
+            if (loc != null) {
+                MyLoc = loc.getLatitude() + "~" + loc.getLongitude();
+                appendLog("GPS: " + MyLoc + " via " + loc.getProvider()
+                        + " acc=" + (int)loc.getAccuracy() + "m");
+            } else {
+                appendLog("GPS: no cached fix available (GPS on, permission granted — open Maps briefly to seed a fix)");
+            }
+        } catch (SecurityException se) {
+            appendLog("GPS: permission denied — " + se.getMessage());
         } catch (Exception ex) {
-            return MyLoc;
+            appendLog("GPS: error — " + ex.getMessage());
         }
+        return MyLoc;
     }
 
     // =====================================================================

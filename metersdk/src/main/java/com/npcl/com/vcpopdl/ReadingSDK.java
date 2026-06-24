@@ -233,38 +233,51 @@ public class ReadingSDK {
     private void UpdateStatusFileNme(String meterNo, String fileName) {
         appendLog("FILE: " + meterNo + " — " + fileName);
     }
-    // GPS — read directly via Android LocationManager. metersdk has no Activity/UI
-    // context of its own (GPSTracker lives in :app and isn't visible to this module),
-    // so this reads the last-known fix straight from the system service instead.
+    // V34: Uses LocationManager directly with GPS → Network → Passive fallback chain.
+    // metersdk has no Activity/UI context of its own (GPSTracker lives in :app and
+    // isn't visible to this module). getLastKnownLocation() is instant (no wait);
+    // returns null only if the provider has never produced a fix on this device —
+    // in that case we skip. Filters out (0,0) which indicates an unacquired fix.
     // Returns "" (non-fatal) if permission isn't granted or no provider has a fix yet —
     // the caller already treats an empty result as "no GPS available", same as Reading.java.
+    @android.annotation.SuppressLint("MissingPermission")
     private String GetLocation() {
         String myLoc = "";
         try {
-            if (androidx.core.content.ContextCompat.checkSelfPermission(context,
-                    android.Manifest.permission.ACCESS_FINE_LOCATION) != android.content.pm.PackageManager.PERMISSION_GRANTED
-                    && androidx.core.content.ContextCompat.checkSelfPermission(context,
-                    android.Manifest.permission.ACCESS_COARSE_LOCATION) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
-                appendLog("GPS_PERMISSION_DENIED — lat/long not captured");
-                return myLoc;
-            }
-            android.location.LocationManager lm =
-                    (android.location.LocationManager) context.getSystemService(Context.LOCATION_SERVICE);
+            android.location.LocationManager lm = (android.location.LocationManager)
+                    context.getSystemService(Context.LOCATION_SERVICE);
             if (lm == null) return myLoc;
-            android.location.Location location = null;
-            if (lm.isProviderEnabled(android.location.LocationManager.NETWORK_PROVIDER)) {
-                location = lm.getLastKnownLocation(android.location.LocationManager.NETWORK_PROVIDER);
+
+            android.location.Location loc = null;
+
+            String[] providers = {
+                android.location.LocationManager.GPS_PROVIDER,
+                android.location.LocationManager.NETWORK_PROVIDER,
+                android.location.LocationManager.PASSIVE_PROVIDER,
+            };
+            for (String provider : providers) {
+                try {
+                    if (!lm.isProviderEnabled(provider)) continue;
+                    android.location.Location candidate = lm.getLastKnownLocation(provider);
+                    if (candidate == null) continue;
+                    // Skip (0,0) — indicates no real fix
+                    if (candidate.getLatitude() == 0.0 && candidate.getLongitude() == 0.0) continue;
+                    // Prefer the most recent fix
+                    if (loc == null || candidate.getTime() > loc.getTime()) loc = candidate;
+                } catch (Exception ignored) {}
             }
-            if (location == null && lm.isProviderEnabled(android.location.LocationManager.GPS_PROVIDER)) {
-                location = lm.getLastKnownLocation(android.location.LocationManager.GPS_PROVIDER);
-            }
-            if (location != null) {
-                myLoc = Double.toString(location.getLatitude()) + "~" + Double.toString(location.getLongitude());
+
+            if (loc != null) {
+                myLoc = loc.getLatitude() + "~" + loc.getLongitude();
+                appendLog("GPS: " + myLoc + " via " + loc.getProvider()
+                        + " acc=" + (int) loc.getAccuracy() + "m");
             } else {
-                appendLog("GPS_NO_FIX — no last-known location from network or GPS provider");
+                appendLog("GPS: no cached fix available (GPS on, permission granted — open Maps briefly to seed a fix)");
             }
+        } catch (SecurityException se) {
+            appendLog("GPS: permission denied — " + se.getMessage());
         } catch (Exception ex) {
-            appendLog("GPS_ERROR: " + ex.getMessage());
+            appendLog("GPS: error — " + ex.getMessage());
         }
         return myLoc;
     }
