@@ -152,6 +152,16 @@ public class ReadingSDK {
     private volatile long    sessionDeadlineMs = 0;
     private static final int SESSION_MAX_SECONDS = 540;
 
+    // LP idle timeout — per-frame silence detection (45s without a new frame → abort LP)
+    private volatile long    lpLastFrameMs   = 0;
+    private volatile long    lpPhaseStartMs  = 0;
+    private volatile int     lpFrameCount    = 0;
+    private static final long LP_IDLE_MS     = 45_000L; // 45s silence between frames → abort LP
+
+    // Phase completion flags for COMPLETE mode
+    private volatile boolean phasePartialLp      = false;
+    private volatile boolean phasePartialBilling = false;
+
     // Consecutive SendPkt failure counter
     private int consecutiveSendFailures = 0;
     private static final int MAX_SEND_FAILURES = 3;
@@ -196,6 +206,12 @@ public class ReadingSDK {
         consecutiveSendFailures = 0;
         sessionDeadlineMs = 0;
         lpDeadlineMs = 0;
+        lpLastFrameMs = 0;
+        lpFrameCount  = 0;
+        lpPhaseStartMs = 0;
+        phasePartialLp = false;
+        phasePartialBilling = false;
+        cleanupTmpFiles(); // remove any .TMP from a previous crashed/aborted session
         currentMeterMake = meterMake;
         final String finalFileName = (fileName != null && !fileName.trim().isEmpty())
                 ? fileName.trim() : "SDK_READ";
@@ -209,6 +225,7 @@ public class ReadingSDK {
     public void abort() {
         abortRequested = true;
         lpDeadlineMs = 0;
+        cleanupTmpFiles(); // delete any in-progress .TMP so no partial file remains on device
     }
 
     public boolean isReading() {
@@ -648,23 +665,34 @@ public class ReadingSDK {
                                 appendLog("SESSION_SKIP_LP: only " + (lpRemaining/1000) + "s remaining — insufficient for LP");
                                 fireProgress(callback, "WARN: ⚠ Insufficient time for Load Profile — skipping", 50);
                             } else {
-                                long lpBudgetMs = Math.min(lpRemaining, 300000L); // cap at 5 min
                                 bytTimOut = (byte) 8;
                                 bytTryCnt = (byte) 2;
-                                lpDeadlineMs = System.currentTimeMillis() + lpBudgetMs;
-                                long lpStartMs = System.currentTimeMillis();
-                                int lpBudgetSec = (int)(lpBudgetMs / 1000);
-                                fireProgress(callback, "Downloading Load Profile... (up to " + lpBudgetSec + "s)", 48);
-                                appendLog("LP_START days=auto bytTimOut=" + bytTimOut
-                                        + " bytTryCnt=" + bytTryCnt + " deadline=" + lpBudgetSec + "s");
+                                // lpDeadlineMs = session reserve boundary (not a hard budget cap)
+                                lpDeadlineMs   = sessionDeadlineMs - 90_000L;
+                                lpLastFrameMs  = 0;
+                                lpFrameCount   = 0;
+                                lpPhaseStartMs = System.currentTimeMillis();
+                                fireProgress(callback, "Downloading Load Profile… (idle-abort after 45s silence)", 48);
+                                appendLog("LP_START days=auto bytTimOut=" + bytTimOut + " bytTryCnt=" + bytTryCnt
+                                        + " idleTimeout=45s sessionReserve=" + (lpRemaining/1000) + "s");
                                 MeterData.append(ReadLoadSurveyData(port, lsDays));
-                                long lpElapsed = System.currentTimeMillis() - lpStartMs;
-                                boolean lpDeadlineHit = lpDeadlineMs > 0 && System.currentTimeMillis() > lpDeadlineMs;
-                                appendLog("LP_END elapsed=" + lpElapsed + "ms dataLen=" + MeterData.length()
-                                        + " deadlineHit=" + lpDeadlineHit);
-                                int lpPct = 48 + (int)(Math.min(lpElapsed, lpBudgetMs) * 16L / Math.max(lpBudgetMs, 1L));
-                                fireProgress(callback, "✓ Load Profile done (" + (lpElapsed/1000) + "s / " + lpBudgetSec + "s budget)",
-                                        Math.min(lpPct, 64));
+                                long lpElapsed = System.currentTimeMillis() - lpPhaseStartMs;
+                                long lpKb      = strbldDLMdata.length() / 2048L;
+                                boolean lpIdleHit    = lpLastFrameMs > 0
+                                        && System.currentTimeMillis() - lpLastFrameMs > LP_IDLE_MS;
+                                boolean lpSessionHit = System.currentTimeMillis() > lpDeadlineMs;
+                                phasePartialLp = (lpIdleHit && lpFrameCount > 0)
+                                        || (lpSessionHit && lpFrameCount > 0)
+                                        || (lpSessionHit && lpFrameCount == 0);
+                                appendLog("LP_END elapsed=" + lpElapsed + "ms frames=" + lpFrameCount
+                                        + " kb=" + lpKb + " idleHit=" + lpIdleHit + " sessionHit=" + lpSessionHit);
+                                if (phasePartialLp) {
+                                    String reason = (lpFrameCount == 0) ? "no response"
+                                            : lpIdleHit ? "meter idle" : "session cap";
+                                    fireProgress(callback, "WARN: ⚠ LP partial — " + lpFrameCount + " fr (" + reason + ") " + (lpElapsed/1000) + "s", 64);
+                                } else {
+                                    fireProgress(callback, "✓ Load Profile — " + lpFrameCount + " fr · " + lpKb + " kB (" + (lpElapsed/1000) + "s)", 64);
+                                }
                                 flushLog();
                                 lpDeadlineMs = 0;
                             }
@@ -804,6 +832,37 @@ public class ReadingSDK {
         }
     }
 
+
+    // =====================================================================
+    // LP ABORT / FRAME TRACKING
+    // =====================================================================
+    private boolean lpShouldAbort() {
+        if (abortRequested) return true;
+        if (lpLastFrameMs > 0 && System.currentTimeMillis() - lpLastFrameMs > LP_IDLE_MS) return true;
+        if (lpDeadlineMs  > 0 && System.currentTimeMillis() > lpDeadlineMs) return true;
+        return false;
+    }
+
+    private void lpFrameReceived() {
+        lpLastFrameMs = System.currentTimeMillis();
+        lpFrameCount++;
+    }
+
+    /** Deletes orphaned .TMP files from aborted/crashed readings. */
+    private void cleanupTmpFiles() {
+        try {
+            File[] dirs = context.getExternalMediaDirs();
+            if (dirs == null || dirs.length == 0 || dirs[0] == null) return;
+            File[] tmps = dirs[0].listFiles(f -> f.getName().endsWith(".TMP"));
+            if (tmps != null) {
+                for (File f : tmps) {
+                    if (f.delete()) appendLog("Cleaned up partial file: " + f.getName());
+                }
+            }
+        } catch (Exception e) {
+            appendLog("cleanupTmpFiles error: " + e.getMessage());
+        }
+    }
 
     // =====================================================================
     // UTILITY
@@ -3782,6 +3841,11 @@ public class ReadingSDK {
      * BUG-20 FIX: Logs warning when TXT exceeds 4 MB.
      */
     public String MakeDataFile(String FileName, String Data) {
+        if (abortRequested) {
+            appendLog("MakeDataFile SKIP: abortRequested — partial file not written");
+            return "";
+        }
+        File tmpFile = null;
         try {
             File[] _extDirs1 = context.getExternalMediaDirs();
             if (_extDirs1 == null || _extDirs1.length == 0 || _extDirs1[0] == null) {
@@ -3789,19 +3853,26 @@ public class ReadingSDK {
                 return "";
             }
             File dir = _extDirs1[0];
+            // Write to .TMP first; rename to .TXT only after a clean close.
+            tmpFile = new File(dir, FileName + ".TMP");
             File logFile = new File(dir, FileName + ".TXT");
             int dataSizeKb = Data.length() / 1024;
             if (dataSizeKb > 4096) appendLog("WARN: TXT file size=" + dataSizeKb + " KB > 4 MB — XML converter may reject");
-            // Overwrite (false) — unique filename per session ensures no data loss
-            BufferedWriter buf = new BufferedWriter(new FileWriter(logFile, false));
+            BufferedWriter buf = new BufferedWriter(new FileWriter(tmpFile, false));
             buf.append("===SESSION START " + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()) + "===");
             buf.newLine();
             buf.append(Data);
             buf.newLine();
             buf.close();
+            if (!tmpFile.renameTo(logFile)) {
+                appendLog("MakeDataFile ERROR: rename .TMP→.TXT failed for " + FileName);
+                tmpFile.delete();
+                return "";
+            }
             appendLog("MakeDataFile OK: " + logFile.getAbsolutePath() + " size=" + dataSizeKb + " KB");
             return FileName + ".TXT";
         } catch (IOException e) {
+            if (tmpFile != null) tmpFile.delete();
             appendLog("MakeDataFile error: " + e.getMessage());
             return "";
         }
@@ -4837,7 +4908,7 @@ public class ReadingSDK {
 
                 do
                 {
-                    if (abortRequested || (lpDeadlineMs > 0 && System.currentTimeMillis() > lpDeadlineMs)) {
+                    if (lpShouldAbort()) {
                         flag3 = false;
                         break;
                     }
@@ -5032,7 +5103,7 @@ public class ReadingSDK {
                     // packet, immediately hits the deadline again, and loops forever —
                     // producing thousands of "GPLS_SEL_BLOCK_ABORT" log lines and
                     // hanging the session indefinitely.
-                    if (abortRequested || (lpDeadlineMs > 0 && System.currentTimeMillis() > lpDeadlineMs)) {
+                    if (lpShouldAbort()) {
                         flag3 = false;
                         flag1 = false;
                         num196 = nTryCount; // force outer do-while to exit too
@@ -5129,7 +5200,7 @@ public class ReadingSDK {
                     {
                         // FIX O2: abort/deadline check so a stalled L&T window
                         // segment does not block indefinitely.
-                        if (abortRequested || (lpDeadlineMs > 0 && System.currentTimeMillis() > lpDeadlineMs)) {
+                        if (lpShouldAbort()) {
                             flag4 = false;
                             appendLog("GPLS_SEG_ABORT block=" + num1);
                             break;
@@ -5450,7 +5521,7 @@ public class ReadingSDK {
                     // iterations (between day requests), not inside a stalled block transfer.
                     // In practice this caused 15+ min LP hangs on L&T meters that sent
                     // one valid HDLC frame then went silent mid-transfer.
-                    if (abortRequested || (lpDeadlineMs > 0 && System.currentTimeMillis() > lpDeadlineMs)) {
+                    if (lpShouldAbort()) {
                         appendLog("GPLS_CONT_DEADLINE_ABORT frame=" + contFrameCount
                                 + " — lpDeadline or abortRequested, breaking HDLC retry loop");
                         flag3 = false;
@@ -5976,7 +6047,7 @@ public class ReadingSDK {
                     // iterations (between day requests), not inside a stalled block transfer.
                     // In practice this caused 15+ min LP hangs on L&T meters that sent
                     // one valid HDLC frame then went silent mid-transfer.
-                    if (abortRequested || (lpDeadlineMs > 0 && System.currentTimeMillis() > lpDeadlineMs)) {
+                    if (lpShouldAbort()) {
                         appendLog("GPLS_CONT_DEADLINE_ABORT frame=" + contFrameCount
                                 + " — lpDeadline or abortRequested, breaking HDLC retry loop");
                         flag3 = false;
@@ -6129,7 +6200,7 @@ public class ReadingSDK {
                 boolean flag3;
                 do {
                     // FIX: Check billing deadline inside block-transfer retry loop
-                    if (abortRequested || (lpDeadlineMs > 0 && System.currentTimeMillis() > lpDeadlineMs)) {
+                    if (lpShouldAbort()) {
                         appendLog("GP1_BLOCK_DEADLINE_ABORT blockNum=" + num1 + " — deadline or abort");
                         flag3 = false;
                         num65 = nTryCount;
@@ -6377,7 +6448,7 @@ public class ReadingSDK {
                 long tStart = System.currentTimeMillis();
                 long attemptDeadline = tStart + ((int)nTimeOut * 1000L);
 
-                if (abortRequested || (lpDeadlineMs > 0 && System.currentTimeMillis() > lpDeadlineMs)) {
+                if (lpShouldAbort()) {
                     appendLog("GPLS_ABORT OBIS=" + sOBISCode + " attr=" + nAttribID);
                     SbData.append(strbldDLMdata);
                     return SbData;
@@ -6526,7 +6597,7 @@ public class ReadingSDK {
             while (moreDlmsBlocks && dlmsBlockCount < MAX_DLMS_BLOCKS) {
                 dlmsBlockCount++;
 
-                if (abortRequested || (lpDeadlineMs > 0 && System.currentTimeMillis() > lpDeadlineMs)) {
+                if (lpShouldAbort()) {
                     appendLog("GPLS_BLOCK_ABORT block=" + dlmsBlockNum);
                     break;
                 }
@@ -6573,7 +6644,7 @@ public class ReadingSDK {
                 long tStart = System.currentTimeMillis();
                 do {
                     do {
-                        if (abortRequested || (lpDeadlineMs > 0 && System.currentTimeMillis() > lpDeadlineMs)) {
+                        if (lpShouldAbort()) {
                             appendLog("GPLS_BLOCK_DEADLINE block=" + dlmsBlockNum);
                             moreDlmsBlocks = false;
                             blockOk = true; // exit loops
@@ -6749,7 +6820,7 @@ public class ReadingSDK {
             this.SendPkt(port, cmd, sz);
             long tStart = System.currentTimeMillis();
             do {
-                if (abortRequested || (lpDeadlineMs > 0 && System.currentTimeMillis() > lpDeadlineMs))
+                if (lpShouldAbort())
                     return false;
                 this.DataReceive(port, 20);
                 if (this.nCounter > 2) {

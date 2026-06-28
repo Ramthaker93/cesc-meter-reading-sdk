@@ -194,6 +194,32 @@ public class Reading extends AppCompatActivity {
     private volatile long    sessionDeadlineMs = 0;
     private static final int SESSION_MAX_SECONDS = 540; // 9 minutes hard cap
 
+    // LP idle timeout — per-frame silence detection (45s without a new frame → abort LP)
+    private volatile long    lpLastFrameMs   = 0;
+    private volatile long    lpPhaseStartMs  = 0;
+    private volatile int     lpFrameCount    = 0;
+    private static final long LP_IDLE_MS     = 45_000L; // 45s silence between frames → abort LP
+
+    // Phase completion flags for COMPLETE mode — all must be false to save file.
+    private volatile boolean phaseSkipMidnight   = false;
+    private volatile boolean phaseSkipLp         = false;
+    private volatile boolean phaseSkipBilling    = false;
+    private volatile boolean phaseSkipEvents     = false;
+    private volatile boolean phasePartialLp      = false;
+    private volatile boolean phasePartialBilling = false;
+
+    // Phase progress dashboard
+    private static final int PH_D1=0, PH_D2=1, PH_D7=2, PH_D4=3, PH_D3=4, PH_D5=5;
+    private static final String[] PH_LABEL = {"Nameplate","Instantaneous","Midnight Snap","Load Profile","Billing","Events"};
+    private final int[]     phSt   = new int[6];
+    private final String[]  phDet  = new String[6];
+    private final long[]    phMs   = new long[6];
+    private android.widget.LinearLayout phDashLayout = null;
+    private final android.widget.TextView[] phRowView = new android.widget.TextView[6];
+    private android.os.Handler phTimer = null;
+    private Runnable phTimerTick = null;
+    private int phActiveIdx = -1;
+
     // Consecutive SendPkt failure counter — incremented each time port.write throws
     // an exception (e.g. srcPos=-1 after USB driver state corruption during long LP reads).
     // Reset to 0 on any successful send. When it reaches 3, abortRequested is set so
@@ -538,6 +564,7 @@ public class Reading extends AppCompatActivity {
             clearProgressLog();
             addProgressLog("Starting — " + meterMake.getDisplayName() + " | " + mode.getDisplayName(), false);
 
+            cleanupTmpFiles(); // remove any .TMP from a previous crashed/aborted session
             if (meterMake == MeterMake.LNG) {
                 abortRequested = false;
                 consecutiveSendFailures = 0;
@@ -597,6 +624,7 @@ public class Reading extends AppCompatActivity {
             currentTask.cancel(true);
         }
         addProgressLog("Abort requested by user.", false);
+        cleanupTmpFiles(); // delete any in-progress .TMP so no partial file remains on device
         runOnUiThread(new Runnable() {
             @Override public void run() {
                 Button btnDownload = findViewById(R.id.btnReadWithTheft);
@@ -703,44 +731,8 @@ public class Reading extends AppCompatActivity {
     }
 
     private void addProgressLog(final String message, final boolean isError) {
-        runOnUiThread(new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    TextView tvLog = (TextView) findViewById(R.id.tvProgressLog);
-                    ScrollView scrollLog = (ScrollView) findViewById(R.id.scrollProgressLog);
-                    if (tvLog == null) return;
-
-                    SimpleDateFormat tf = new SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault());
-                    String timestamp = tf.format(new Date());
-                    String icon   = isError ? "⚠ " : "• ";
-                    String newLine = "[" + timestamp + "] " + icon + message + "\n";
-
-                    // Prepend: newest at top
-                    String current = tvLog.getText().toString();
-                    String combined = newLine + current;
-
-                    // Build SpannableString for per-line colouring
-                    android.text.SpannableStringBuilder ssb =
-                            new android.text.SpannableStringBuilder(combined);
-                    int color = isError
-                            ? Color.parseColor("#C62828")   // red for errors/warnings
-                            : Color.parseColor("#1A237E");  // dark-blue for normal
-                    ssb.setSpan(
-                            new android.text.style.ForegroundColorSpan(color),
-                            0, newLine.length(),
-                            android.text.Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
-                    tvLog.setText(ssb);
-
-                    // Scroll to top so the newest line is always visible
-                    if (scrollLog != null) {
-                        scrollLog.post(new Runnable() {
-                            @Override public void run() { scrollLog.scrollTo(0, 0); }
-                        });
-                    }
-                } catch (Exception ignored) {}
-            }
-        });
+        // Log-view removed — phase dashboard replaces the scrollable log.
+        // File-based logging still works via appendLog() / flushLog().
     }
 
     private void clearProgressLog() {
@@ -769,6 +761,191 @@ public class Reading extends AppCompatActivity {
                 if (pb != null) pb.setProgress(p);
             }
         });
+    }
+
+    // =====================================================================
+    // LP ABORT / FRAME TRACKING
+    // =====================================================================
+    private boolean lpShouldAbort() {
+        if (abortRequested) return true;
+        if (lpLastFrameMs > 0 && System.currentTimeMillis() - lpLastFrameMs > LP_IDLE_MS) return true;
+        if (lpDeadlineMs  > 0 && System.currentTimeMillis() > lpDeadlineMs) return true;
+        return false;
+    }
+
+    private void lpFrameReceived() {
+        lpLastFrameMs = System.currentTimeMillis();
+        lpFrameCount++;
+        if (lpFrameCount % 5 == 0) {
+            long kb = strbldDLMdata.length() / 2048L;
+            long t  = (System.currentTimeMillis() - lpPhaseStartMs) / 1000L;
+            startPhase(PH_D4, lpFrameCount + " fr · " + kb + " kB · " + t + "s");
+        }
+    }
+
+    /** Deletes orphaned .TMP files from aborted/crashed readings. */
+    private void cleanupTmpFiles() {
+        try {
+            File[] dirs = getExternalMediaDirs();
+            if (dirs == null || dirs.length == 0 || dirs[0] == null) return;
+            File[] tmps = dirs[0].listFiles(f -> f.getName().endsWith(".TMP"));
+            if (tmps != null) {
+                for (File f : tmps) {
+                    if (f.delete()) appendLog("Cleaned up partial file: " + f.getName());
+                }
+            }
+        } catch (Exception e) {
+            appendLog("cleanupTmpFiles error: " + e.getMessage());
+        }
+    }
+
+    // =====================================================================
+    // PHASE PROGRESS DASHBOARD
+    // =====================================================================
+    private void initPhaseDashboard() {
+        runOnUiThread(new Runnable() { @Override public void run() {
+            try {
+                java.util.Arrays.fill(phSt, 0);
+                java.util.Arrays.fill(phDet, "");
+                java.util.Arrays.fill(phMs, 0L);
+                phActiveIdx = -1;
+
+                // Hide the old scrollable log — phase dashboard replaces it
+                android.view.View scrollLog = findViewById(R.id.scrollProgressLog);
+                if (scrollLog != null) scrollLog.setVisibility(android.view.View.GONE);
+
+                // Find a parent to anchor the dashboard
+                android.view.ViewGroup parent = null;
+                int insertIdx = 0;
+                if (scrollLog != null && scrollLog.getParent() instanceof android.view.ViewGroup) {
+                    parent = (android.view.ViewGroup) scrollLog.getParent();
+                    insertIdx = parent.indexOfChild(scrollLog);
+                } else {
+                    android.view.View anchor = findViewById(R.id.tvCurrentStep);
+                    if (anchor != null && anchor.getParent() instanceof android.view.ViewGroup) {
+                        parent = (android.view.ViewGroup) anchor.getParent();
+                        insertIdx = parent.indexOfChild(anchor) + 1;
+                    }
+                }
+                if (parent == null) return;
+
+                // Remove previous dashboard if any
+                if (phDashLayout != null && phDashLayout.getParent() != null)
+                    ((android.view.ViewGroup) phDashLayout.getParent()).removeView(phDashLayout);
+
+                phDashLayout = new android.widget.LinearLayout(Reading.this);
+                phDashLayout.setOrientation(android.widget.LinearLayout.VERTICAL);
+                phDashLayout.setPadding(dp(12), dp(10), dp(12), dp(8));
+                phDashLayout.setBackgroundColor(Color.parseColor("#F8F9FA"));
+
+                for (int i = 0; i < 6; i++) {
+                    android.widget.TextView tv = new android.widget.TextView(Reading.this);
+                    tv.setTypeface(android.graphics.Typeface.MONOSPACE);
+                    tv.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 13f);
+                    tv.setPadding(dp(4), dp(4), dp(4), dp(4));
+                    tv.setText(phaseRowText(i));
+                    phRowView[i] = tv;
+                    phDashLayout.addView(tv);
+                }
+                parent.addView(phDashLayout, insertIdx);
+            } catch (Exception ignored) {}
+        }});
+    }
+
+    private int dp(int val) {
+        return (int)(val * getResources().getDisplayMetrics().density + 0.5f);
+    }
+
+    private String phaseRowText(int i) {
+        String icon;
+        switch (phSt[i]) {
+            case 1: icon = "⟳"; break; // ⟳
+            case 2: icon = "✓"; break; // ✓
+            case 3: icon = "—"; break; // —
+            case 4: icon = "⚠"; break; // ⚠
+            case 5: icon = "✗"; break; // ✗
+            default: icon = "○"; break; // ○
+        }
+        String label = (i < PH_LABEL.length ? PH_LABEL[i] : "Phase" + i);
+        String detail = (phDet[i] != null && !phDet[i].isEmpty()) ? "  " + phDet[i] : "";
+        if (phSt[i] == 1 && phMs[i] > 0) {
+            long secs = (System.currentTimeMillis() - phMs[i]) / 1000L;
+            detail = "  " + (phDet[i] != null && !phDet[i].isEmpty() ? phDet[i] + "  " : "") + secs + "s";
+        }
+        return icon + " " + label + detail;
+    }
+
+    private void refreshPhaseRow(final int i) {
+        runOnUiThread(new Runnable() { @Override public void run() {
+            try {
+                if (phRowView[i] == null) return;
+                phRowView[i].setText(phaseRowText(i));
+                switch (phSt[i]) {
+                    case 1: phRowView[i].setTextColor(Color.parseColor("#1565C0")); break;
+                    case 2: phRowView[i].setTextColor(Color.parseColor("#2E7D32")); break;
+                    case 3: phRowView[i].setTextColor(Color.parseColor("#9E9E9E")); break;
+                    case 4: phRowView[i].setTextColor(Color.parseColor("#E65100")); break;
+                    case 5: phRowView[i].setTextColor(Color.parseColor("#C62828")); break;
+                    default: phRowView[i].setTextColor(Color.parseColor("#9E9E9E")); break;
+                }
+            } catch (Exception ignored) {}
+        }});
+    }
+
+    // Mark phase as running; call from background thread
+    private void startPhase(int idx, String detail) {
+        if (phMs[idx] == 0) phMs[idx] = System.currentTimeMillis();
+        phSt[idx] = 1;
+        phDet[idx] = detail != null ? detail : "";
+        phActiveIdx = idx;
+        refreshPhaseRow(idx);
+        // Ensure timer is running
+        if (phTimer == null) {
+            phTimer = new android.os.Handler(android.os.Looper.getMainLooper());
+            phTimerTick = new Runnable() {
+                @Override public void run() {
+                    android.os.Handler h = phTimer;
+                    if (phActiveIdx >= 0 && phSt[phActiveIdx] == 1 && h != null) {
+                        refreshPhaseRow(phActiveIdx);
+                        h.postDelayed(this, 1000);
+                    }
+                }
+            };
+            phTimer.postDelayed(phTimerTick, 1000);
+        }
+    }
+
+    private void donePhase(int idx, String detail) {
+        stopPhaseTimer();
+        long elapsed = phMs[idx] > 0 ? (System.currentTimeMillis() - phMs[idx]) / 1000L : 0;
+        phSt[idx] = 2;
+        phDet[idx] = (detail != null && !detail.isEmpty() ? detail + "  " : "") + elapsed + "s";
+        phActiveIdx = -1;
+        refreshPhaseRow(idx);
+    }
+
+    private void skipPhase(int idx, String reason) {
+        stopPhaseTimer();
+        phSt[idx] = 3;
+        phDet[idx] = reason != null ? reason : "Skipped";
+        if (phActiveIdx == idx) phActiveIdx = -1;
+        refreshPhaseRow(idx);
+    }
+
+    private void partialPhase(int idx, String detail) {
+        stopPhaseTimer();
+        phSt[idx] = 4;
+        phDet[idx] = detail != null ? detail : "Partial";
+        if (phActiveIdx == idx) phActiveIdx = -1;
+        refreshPhaseRow(idx);
+    }
+
+    private void stopPhaseTimer() {
+        if (phTimer != null && phTimerTick != null) {
+            phTimer.removeCallbacks(phTimerTick);
+            phTimerTick = null;
+            phTimer = null;
+        }
     }
 
     // =====================================================================
@@ -1025,6 +1202,10 @@ public class Reading extends AppCompatActivity {
                 // END RTC CHECK
                 // ============================================================
 
+                // ── Init phase dashboard and mark NamePlate running ──────────────
+                initPhaseDashboard();
+                startPhase(PH_D1, "");
+
                 // Name Plate
                 // Fast timeout: all NamePlate registers are single-block reads responding
                 // in <500ms. bytTimOut=8,bytTryCnt=3 means absent OBIS burn 24s each.
@@ -1042,8 +1223,10 @@ public class Reading extends AppCompatActivity {
                 if (sbNm != null && sbNm.length() > 0) {
                     MeterData.append(sbNm);
                     UpdateStatus(CescRajMeterno, "Name Plate OK");
+                    donePhase(PH_D1, "");
                     publishProgress("INFO|Name Plate read OK", "40");
                 } else {
+                    partialPhase(PH_D1, "incomplete");
                     publishProgress("WARN|Name Plate read incomplete — continuing.", "40");
                 }
 
@@ -1060,10 +1243,12 @@ public class Reading extends AppCompatActivity {
                         bytTimOut = (byte) 3;
                         bytTryCnt = (byte) 1;
                         long tInst0 = System.currentTimeMillis();
+                        startPhase(PH_D2, "");
                         publishProgress("INFO|Downloading Instantaneous data...", "50");
                         MeterData.append(ReadInstantData(port));
                         bytTimOut = savedTimOutI;
                         bytTryCnt = savedTryCntI;
+                        donePhase(PH_D2, "");
                         UpdateStatus(CescRajMeterno, "Instantaneous OK");
                         publishProgress("INFO|Instantaneous read OK (" + ((System.currentTimeMillis()-tInst0)/1000) + "s)", "80");
                         break;
@@ -1078,8 +1263,10 @@ public class Reading extends AppCompatActivity {
                         bytTimOut = (byte) 4;
                         bytTryCnt = (byte) 1;
                         long tBm_inst = System.currentTimeMillis();
+                        startPhase(PH_D2, "");
                         publishProgress("INFO|Downloading Instantaneous data...", "45");
                         MeterData.append(ReadInstantData(port));
+                        donePhase(PH_D2, "");
                         publishProgress("INFO|✓ Instantaneous done (" + ((System.currentTimeMillis()-tBm_inst)/1000) + "s) — reading Billing...", "55");
                         UpdateStatus(CescRajMeterno, "Instantaneous OK");
                         // Fix 2: 10s block timeout for ReadBillingData — L&T billing pages
@@ -1088,6 +1275,7 @@ public class Reading extends AppCompatActivity {
                         bytTimOut = (byte) 10;
                         bytTryCnt = (byte) 3;
                         long tBm_bill = System.currentTimeMillis();
+                        startPhase(PH_D3, "");
                         publishProgress("INFO|Downloading Billing data... (15-30s)", "56");
                         StringBuilder BillStr = ReadBillingData(port, readingMode);
                         long tBm_billE = (System.currentTimeMillis()-tBm_bill)/1000;
@@ -1095,12 +1283,15 @@ public class Reading extends AppCompatActivity {
                         bytTryCnt = savedTryCntBill;
                         if (BillStr.length() > 10) {
                             MeterData.append(BillStr);
+                            donePhase(PH_D3, "");
                             UpdateStatus(CescRajMeterno, "Billing OK");
                             publishProgress("INFO|✓ Billing done (" + tBm_billE + "s)", "80");
                         } else {
+                            partialPhase(PH_D3, "empty");
                             UpdateStatus(CescRajMeterno, "Billing FAILED");
                             publishProgress("WARN|⚠ Billing empty — check meter (" + tBm_billE + "s)", "80");
                         }
+                        stopPhaseTimer();
                         break;
                     }
 
@@ -1119,6 +1310,10 @@ public class Reading extends AppCompatActivity {
                         //   Total         : guaranteed ≤ 420s regardless of meter behaviour
                         long sessionStartMs = System.currentTimeMillis();
                         sessionDeadlineMs   = sessionStartMs + (SESSION_MAX_SECONDS * 1000L);
+                        // Reset phase flags — will be set if any phase is skipped or cut short
+                        phaseSkipMidnight   = false; phaseSkipLp         = false;
+                        phaseSkipBilling    = false; phaseSkipEvents     = false;
+                        phasePartialLp      = false; phasePartialBilling = false;
                         appendLog("SESSION_DEADLINE set=" + SESSION_MAX_SECONDS + "s deadline="
                                 + new java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
                                 .format(new java.util.Date(sessionDeadlineMs)));
@@ -1148,12 +1343,14 @@ public class Reading extends AppCompatActivity {
 
                         // ── Phase 1: Instantaneous ───────────────────────────────────────
                         long tInstStart = System.currentTimeMillis();
+                        startPhase(PH_D2, "");
                         publishProgress("INFO|Downloading Instantaneous data... (5-15s)", "30");
                         MeterData.append(ReadInstantData(port));
                         long tInstElapsed = System.currentTimeMillis() - tInstStart;
                         appendLog("INSTANT_DONE elapsed=" + tInstElapsed + "ms");
                         if (tInstElapsed > 60000)
                             appendLog("SESSION_WARN: Instantaneous took " + (tInstElapsed/1000) + "s — check export OBIS timeouts");
+                        donePhase(PH_D2, "");
                         publishProgress("INFO|✓ Instantaneous done (" + (tInstElapsed/1000) + "s)", "38");
                         UpdateStatus(CescRajMeterno, "Instantaneous OK");
 
@@ -1166,14 +1363,21 @@ public class Reading extends AppCompatActivity {
                         // pre-optimization MRI reading order which correctly returns 4297 records.
                         if (System.currentTimeMillis() >= sessionDeadlineMs) {
                             appendLog("SESSION_SKIP_MIDNIGHT: session deadline reached after Instantaneous");
+                            phaseSkipMidnight = true;
+                            skipPhase(PH_D7, "session cap");
+                            skipPhase(PH_D4, "session cap");
+                            skipPhase(PH_D3, "session cap");
+                            skipPhase(PH_D5, "session cap");
                             publishProgress("WARN|⚠ Session limit reached — skipping Midnight+LP+Billing+Events", "79");
                         } else {
                             bytTimOut = fastTimOut;
                             bytTryCnt = fastTryCnt;
+                            startPhase(PH_D7, "");
                             long tMidStart = System.currentTimeMillis();
                             publishProgress("INFO|Downloading Midnight Snapshot... (5-10s)", "40");
                             MeterData.append(ReadMidnightSnapshot(port, lsDays));
                             long tMidElapsed = System.currentTimeMillis() - tMidStart;
+                            donePhase(PH_D7, "");
                             publishProgress("INFO|✓ Midnight done (" + (tMidElapsed/1000) + "s)", "46");
                             UpdateStatus(CescRajMeterno, "Midnight OK");
                             flushLog();
@@ -1181,30 +1385,54 @@ public class Reading extends AppCompatActivity {
                             // ── Phase 3: Load Profile ─────────────────────────────────────
                             // READ BEFORE BILLING — same reason as midnight above.
                             // Reserve 90s for billing (up to 60s) + events (30s) buffer.
-                            // Floor at 60s: if we have less than 60s left, LP is skipped.
-                            // Hard cap at 300s (5 min) to leave billing+events headroom.
+                            // No wall-clock cap on LP: instead we abort if the meter goes
+                            // SILENT for LP_IDLE_MS (45s) between consecutive HDLC frames.
                             long lpRemaining = sessionDeadlineMs - System.currentTimeMillis() - 90000L;
                             if (lpRemaining < 60000L) {
                                 appendLog("SESSION_SKIP_LP: only " + (lpRemaining/1000) + "s remaining — insufficient for LP");
+                                phaseSkipLp = true;
+                                skipPhase(PH_D4, "insufficient session time");
                                 publishProgress("WARN|⚠ Insufficient time for Load Profile — skipping", "50");
                             } else {
-                                long lpBudgetMs = Math.min(lpRemaining, 300000L); // cap at 5 min
                                 bytTimOut = (byte) 8;
                                 bytTryCnt = (byte) 2;
-                                lpDeadlineMs = System.currentTimeMillis() + lpBudgetMs;
-                                long lpStartMs = System.currentTimeMillis();
-                                int lpBudgetSec = (int)(lpBudgetMs / 1000);
-                                publishProgress("INFO|Downloading Load Profile... (up to " + lpBudgetSec + "s)", "48");
-                                appendLog("LP_START days=auto bytTimOut=" + bytTimOut
-                                        + " bytTryCnt=" + bytTryCnt + " deadline=" + lpBudgetSec + "s");
+                                // lpDeadlineMs = session reserve boundary (not a hard budget cap)
+                                lpDeadlineMs   = sessionDeadlineMs - 90_000L;
+                                lpLastFrameMs  = 0;
+                                lpFrameCount   = 0;
+                                lpPhaseStartMs = System.currentTimeMillis();
+                                startPhase(PH_D4, "starting…");
+                                publishProgress("INFO|Downloading Load Profile… (idle-abort after 45s silence)", "48");
+                                appendLog("LP_START days=auto bytTimOut=" + bytTimOut + " bytTryCnt=" + bytTryCnt
+                                        + " idleTimeout=45s sessionReserve=" + (lpRemaining/1000) + "s");
                                 MeterData.append(ReadLoadSurveyData(port, lsDays));
-                                long lpElapsed = System.currentTimeMillis() - lpStartMs;
-                                boolean lpDeadlineHit = lpDeadlineMs > 0 && System.currentTimeMillis() > lpDeadlineMs;
-                                appendLog("LP_END elapsed=" + lpElapsed + "ms dataLen=" + MeterData.length()
-                                        + " deadlineHit=" + lpDeadlineHit);
-                                int lpPct = 48 + (int)(Math.min(lpElapsed, lpBudgetMs) * 16L / Math.max(lpBudgetMs, 1L));
-                                publishProgress("INFO|✓ Load Profile done (" + (lpElapsed/1000) + "s / " + lpBudgetSec + "s budget)",
-                                        Math.min(lpPct, 64) + "");
+                                long lpElapsed = System.currentTimeMillis() - lpPhaseStartMs;
+                                long lpKb      = strbldDLMdata.length() / 2048L;
+                                boolean lpIdleHit    = lpLastFrameMs > 0
+                                        && System.currentTimeMillis() - lpLastFrameMs > LP_IDLE_MS;
+                                boolean lpSessionHit = System.currentTimeMillis() > lpDeadlineMs;
+                                phasePartialLp = (lpIdleHit && lpFrameCount > 0)
+                                        || (lpSessionHit && lpFrameCount > 0)
+                                        || (lpSessionHit && lpFrameCount == 0);
+                                appendLog("LP_END elapsed=" + lpElapsed + "ms frames=" + lpFrameCount
+                                        + " kb=" + lpKb + " idleHit=" + lpIdleHit + " sessionHit=" + lpSessionHit);
+                                String lpDetail;
+                                if (lpFrameCount == 0 && lpSessionHit) {
+                                    lpDetail = "no response";
+                                } else if (lpFrameCount == 0) {
+                                    lpDetail = "no data";
+                                } else {
+                                    lpDetail = lpFrameCount + " fr · " + lpKb + " kB";
+                                }
+                                if (phasePartialLp) {
+                                    String reason = (lpFrameCount == 0) ? "no response"
+                                            : lpIdleHit ? "meter idle" : "session cap";
+                                    partialPhase(PH_D4, lpDetail + " (" + reason + ")");
+                                    publishProgress("WARN|⚠ LP — " + lpDetail + " (" + reason + ") " + (lpElapsed/1000) + "s", "64");
+                                } else {
+                                    donePhase(PH_D4, lpDetail);
+                                    publishProgress("INFO|✓ Load Profile — " + lpDetail + " (" + (lpElapsed/1000) + "s)", "64");
+                                }
                                 flushLog();
                                 lpDeadlineMs = 0;
                             }
@@ -1214,8 +1442,12 @@ public class Reading extends AppCompatActivity {
                             // corrupt the Genus firmware's profile-generic buffer state.
                             if (System.currentTimeMillis() >= sessionDeadlineMs) {
                                 appendLog("SESSION_SKIP_BILLING: session deadline reached after LP");
+                                phaseSkipBilling = true; phaseSkipEvents = true;
+                                skipPhase(PH_D3, "session time exhausted");
+                                skipPhase(PH_D5, "session time exhausted");
                                 publishProgress("WARN|⚠ Session limit reached — skipping Billing+Events", "79");
                             } else {
+                                startPhase(PH_D3, "");
                                 bytTimOut = billingTimOut;
                                 bytTryCnt = billingTryCnt;
                                 drainPort(port);
@@ -1228,12 +1460,15 @@ public class Reading extends AppCompatActivity {
                                 appendLog("BILLING_DONE elapsed=" + tBillElapsed + "ms");
                                 flushLog();
                                 if (billingData != null && billingData.length() > 0) {
+                                    donePhase(PH_D3, "");
                                     publishProgress("INFO|✓ Billing done (" + (tBillElapsed/1000) + "s)", "72");
                                     UpdateStatus(CescRajMeterno, "Billing OK");
                                 } else {
+                                    phasePartialBilling = true;
+                                    partialPhase(PH_D3, "empty — no billing cycle yet?");
                                     publishProgress("WARN|⚠ Billing empty — check meter (" + (tBillElapsed/1000) + "s)", "72");
                                     appendLog("BILLING_WARN: Billing section empty in COMPLETE mode");
-                                    UpdateStatus(CescRajMeterno, "Billing FAILED");
+                                    UpdateStatus(CescRajMeterno, "Billing EMPTY");
                                 }
 
                                 // ── REASSOC after billing / before events ─────────────────
@@ -1265,20 +1500,25 @@ public class Reading extends AppCompatActivity {
                                 // ── Phase 5: Events ───────────────────────────────────────
                                 if (System.currentTimeMillis() >= sessionDeadlineMs) {
                                     appendLog("SESSION_SKIP_EVENTS: session deadline reached — skipping events");
+                                    phaseSkipEvents = true;
+                                    skipPhase(PH_D5, "session time exhausted");
                                     publishProgress("WARN|⚠ Session limit reached — Events skipped", "79");
                                 } else {
+                                    startPhase(PH_D5, "");
                                     bytTimOut = fastTimOut;
                                     bytTryCnt = fastTryCnt;
                                     long tEvtStart = System.currentTimeMillis();
                                     publishProgress("INFO|Downloading Events... (10-20s)", "74");
                                     MeterData.append(ReadEventData(port));
                                     long tEvtElapsed = System.currentTimeMillis() - tEvtStart;
+                                    donePhase(PH_D5, "");
                                     publishProgress("INFO|✓ Events done (" + (tEvtElapsed/1000) + "s)", "79");
                                 }
                             } // end Billing+Events
                         } // end Midnight+LP+Billing+Events
 
                         // ── Session summary ──────────────────────────────────────────────
+                        stopPhaseTimer();
                         long sessionElapsed = System.currentTimeMillis() - sessionStartMs;
                         boolean sessionOverrun = sessionElapsed > (SESSION_MAX_SECONDS * 1000L);
                         appendLog("SESSION_END elapsed=" + (sessionElapsed/1000) + "s limit=" + SESSION_MAX_SECONDS + "s overrun=" + sessionOverrun);
@@ -1311,6 +1551,36 @@ public class Reading extends AppCompatActivity {
 
                 validateMeterDataForXML(MeterData, readMode);
                 logMeterDataSummary(MeterData);
+
+                // ── COMPLETE mode: abort save if any phase was skipped or LP was cut short ──
+                if (readingMode == ReadingMode.COMPLETE) {
+                    StringBuilder skipped = new StringBuilder();
+                    if (phaseSkipMidnight)   skipped.append("Midnight ");
+                    if (phaseSkipLp)         skipped.append("LP-Skipped ");
+                    if (phasePartialLp)      skipped.append("LP-Incomplete ");
+                    if (phaseSkipBilling)    skipped.append("Billing-Skipped ");
+                    if (phasePartialBilling) skipped.append("Billing-Empty ");
+                    if (phaseSkipEvents)     skipped.append("Events ");
+                    if (skipped.length() > 0) {
+                        String skippedStr = skipped.toString().trim();
+                        String hint = phasePartialBilling && !phasePartialLp && !phaseSkipLp
+                                ? " If this is a new meter with no billing cycle yet, use BILLING or SMARTMRI mode."
+                                : " Reconnect optical probe and retry.";
+                        appendLog("SAVE_ABORTED: COMPLETE mode — incomplete phases: " + skippedStr);
+                        publishProgress("WARN|⚠ Reading INCOMPLETE (" + skippedStr
+                                + ") — file NOT saved." + hint, "90");
+                        try {
+                            DatabaseHandler dbObj = new DatabaseHandler(getApplicationContext());
+                            dbObj.ExecuteQry("UPDATE ReadingLog SET MeterNo='" + MeterNo
+                                    + "', Status='Incomplete'"
+                                    + " WHERE MeterNo='PENDING' AND Status='Reading Start'");
+                        } catch (Exception dbEx) {
+                            appendLog("SAVE_ABORTED_DB_EX: " + dbEx.getMessage());
+                        }
+                        return "Reading Incomplete — " + skippedStr
+                                + " not downloaded. Please reconnect and retry.";
+                    }
+                }
 
                 // Store data for display
                 lastMeterData = new StringBuilder(MeterData);
@@ -4954,6 +5224,11 @@ public class Reading extends AppCompatActivity {
      * BUG-20 FIX: Logs warning when TXT exceeds 4 MB.
      */
     public String MakeDataFile(String FileName, String Data) {
+        if (abortRequested) {
+            appendLog("MakeDataFile SKIP: abortRequested — partial file not written");
+            return "";
+        }
+        File tmpFile = null;
         try {
             File[] _extDirs1 = getExternalMediaDirs();
             if (_extDirs1 == null || _extDirs1.length == 0 || _extDirs1[0] == null) {
@@ -4961,19 +5236,27 @@ public class Reading extends AppCompatActivity {
                 return "";
             }
             File dir = _extDirs1[0];
+            // Write to .TMP first; rename to .TXT only after a clean close.
+            // A crash or abort mid-write therefore never leaves a partial .TXT on the device.
+            tmpFile = new File(dir, FileName + ".TMP");
             File logFile = new File(dir, FileName + ".TXT");
             int dataSizeKb = Data.length() / 1024;
             if (dataSizeKb > 4096) appendLog("WARN: TXT file size=" + dataSizeKb + " KB > 4 MB — XML converter may reject");
-            // Overwrite (false) — unique filename per session ensures no data loss
-            BufferedWriter buf = new BufferedWriter(new FileWriter(logFile, false));
+            BufferedWriter buf = new BufferedWriter(new FileWriter(tmpFile, false));
             buf.append("===SESSION START " + new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new java.util.Date()) + "===");
             buf.newLine();
             buf.append(Data);
             buf.newLine();
             buf.close();
+            if (!tmpFile.renameTo(logFile)) {
+                appendLog("MakeDataFile ERROR: rename .TMP→.TXT failed for " + FileName);
+                tmpFile.delete();
+                return "";
+            }
             appendLog("MakeDataFile OK: " + logFile.getAbsolutePath() + " size=" + dataSizeKb + " KB");
             return FileName + ".TXT";
         } catch (IOException e) {
+            if (tmpFile != null) tmpFile.delete();
             appendLog("MakeDataFile error: " + e.getMessage());
             return "";
         }
@@ -6072,7 +6355,7 @@ public class Reading extends AppCompatActivity {
 
                 do
                 {
-                    if (abortRequested || (lpDeadlineMs > 0 && System.currentTimeMillis() > lpDeadlineMs)) {
+                    if (lpShouldAbort()) {
                         flag3 = false;
                         break;
                     }
@@ -6267,7 +6550,7 @@ public class Reading extends AppCompatActivity {
                     // packet, immediately hits the deadline again, and loops forever —
                     // producing thousands of "GPLS_SEL_BLOCK_ABORT" log lines and
                     // hanging the session indefinitely.
-                    if (abortRequested || (lpDeadlineMs > 0 && System.currentTimeMillis() > lpDeadlineMs)) {
+                    if (lpShouldAbort()) {
                         flag3 = false;
                         flag1 = false;
                         num196 = nTryCount; // force outer do-while to exit too
@@ -6364,7 +6647,7 @@ public class Reading extends AppCompatActivity {
                     {
                         // FIX O2: abort/deadline check so a stalled L&T window
                         // segment does not block indefinitely.
-                        if (abortRequested || (lpDeadlineMs > 0 && System.currentTimeMillis() > lpDeadlineMs)) {
+                        if (lpShouldAbort()) {
                             flag4 = false;
                             appendLog("GPLS_SEG_ABORT block=" + num1);
                             break;
@@ -6685,7 +6968,7 @@ public class Reading extends AppCompatActivity {
                     // iterations (between day requests), not inside a stalled block transfer.
                     // In practice this caused 15+ min LP hangs on L&T meters that sent
                     // one valid HDLC frame then went silent mid-transfer.
-                    if (abortRequested || (lpDeadlineMs > 0 && System.currentTimeMillis() > lpDeadlineMs)) {
+                    if (lpShouldAbort()) {
                         appendLog("GPLS_CONT_DEADLINE_ABORT frame=" + contFrameCount
                                 + " — lpDeadline or abortRequested, breaking HDLC retry loop");
                         flag3 = false;
@@ -7211,7 +7494,7 @@ public class Reading extends AppCompatActivity {
                     // iterations (between day requests), not inside a stalled block transfer.
                     // In practice this caused 15+ min LP hangs on L&T meters that sent
                     // one valid HDLC frame then went silent mid-transfer.
-                    if (abortRequested || (lpDeadlineMs > 0 && System.currentTimeMillis() > lpDeadlineMs)) {
+                    if (lpShouldAbort()) {
                         appendLog("GPLS_CONT_DEADLINE_ABORT frame=" + contFrameCount
                                 + " — lpDeadline or abortRequested, breaking HDLC retry loop");
                         flag3 = false;
@@ -7364,7 +7647,7 @@ public class Reading extends AppCompatActivity {
                 boolean flag3;
                 do {
                     // FIX: Check billing deadline inside block-transfer retry loop
-                    if (abortRequested || (lpDeadlineMs > 0 && System.currentTimeMillis() > lpDeadlineMs)) {
+                    if (lpShouldAbort()) {
                         appendLog("GP1_BLOCK_DEADLINE_ABORT blockNum=" + num1 + " — deadline or abort");
                         flag3 = false;
                         num65 = nTryCount;
@@ -7612,7 +7895,7 @@ public class Reading extends AppCompatActivity {
                 long tStart = System.currentTimeMillis();
                 long attemptDeadline = tStart + ((int)nTimeOut * 1000L);
 
-                if (abortRequested || (lpDeadlineMs > 0 && System.currentTimeMillis() > lpDeadlineMs)) {
+                if (lpShouldAbort()) {
                     appendLog("GPLS_ABORT OBIS=" + sOBISCode + " attr=" + nAttribID);
                     SbData.append(strbldDLMdata);
                     return SbData;
@@ -7761,7 +8044,7 @@ public class Reading extends AppCompatActivity {
             while (moreDlmsBlocks && dlmsBlockCount < MAX_DLMS_BLOCKS) {
                 dlmsBlockCount++;
 
-                if (abortRequested || (lpDeadlineMs > 0 && System.currentTimeMillis() > lpDeadlineMs)) {
+                if (lpShouldAbort()) {
                     appendLog("GPLS_BLOCK_ABORT block=" + dlmsBlockNum);
                     break;
                 }
@@ -7808,7 +8091,7 @@ public class Reading extends AppCompatActivity {
                 long tStart = System.currentTimeMillis();
                 do {
                     do {
-                        if (abortRequested || (lpDeadlineMs > 0 && System.currentTimeMillis() > lpDeadlineMs)) {
+                        if (lpShouldAbort()) {
                             appendLog("GPLS_BLOCK_DEADLINE block=" + dlmsBlockNum);
                             moreDlmsBlocks = false;
                             blockOk = true; // exit loops
@@ -7984,7 +8267,7 @@ public class Reading extends AppCompatActivity {
             this.SendPkt(port, cmd, sz);
             long tStart = System.currentTimeMillis();
             do {
-                if (abortRequested || (lpDeadlineMs > 0 && System.currentTimeMillis() > lpDeadlineMs))
+                if (lpShouldAbort())
                     return false;
                 this.DataReceive(port, 20);
                 if (this.nCounter > 2) {
