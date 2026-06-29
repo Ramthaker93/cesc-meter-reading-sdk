@@ -10121,7 +10121,8 @@ public class ReadingSDK {
                 // in the payload and comparing against EIU.
                 String _selHex = _mp.length >= 4 ? _mp[_mp.length - 1].toLowerCase() : "";
                 int selCount = 0;
-                for (int _si = 0; (_si = _selHex.indexOf("090c", _si)) >= 0; _si += 4) selCount++;
+                int _si = 0;
+                while ((_si = _selHex.indexOf("090c", _si)) >= 0) { selCount++; _si += 4; }
                 if (selCount < midnightEiu) {
                     appendLog("MIDNIGHT_SEL_PARTIAL selCount=" + selCount + " < EIU=" + midnightEiu
                             + " — Secure block-transfer truncated; retrying with full buffer read");
