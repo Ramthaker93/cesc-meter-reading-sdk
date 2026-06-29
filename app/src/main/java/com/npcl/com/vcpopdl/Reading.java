@@ -10979,6 +10979,8 @@ public class Reading extends AppCompatActivity {
                 String etaStr = etaSecs < 60 ? etaSecs + "s" : (etaSecs/60) + "m " + (etaSecs%60) + "s";
                 appendLog("LP: reading " + lsDays + " days | Target ~" + targetRecords
                         + " records | ETA ~" + etaStr);
+                boolean stalledReconnectDone = false; // V37: one reconnect attempt per LP read
+                int consecutiveEmptyDays = 0;         // V37: track consecutive NO_DATA days
                 for (int i = lsDays; i >= 0; i--) {
                     if (abortRequested) {
                         appendLog("RLS_SEL_ABORT at day=" + i);
@@ -11074,6 +11076,7 @@ public class Reading extends AppCompatActivity {
 
                         lpPageHexList.add(lpHex);
                         selectiveOk++;
+                        consecutiveEmptyDays = 0; // V37: reset on successful day
                         appendLog("RLS_SEL_DAY day=-" + i + " len=" + lpHex.length() + " records=" + cnt);
 
                         // ── LP PAGINATION: some meters (e.g. HPL) page their GetParameterSelective
@@ -11120,7 +11123,46 @@ public class Reading extends AppCompatActivity {
                         appendLog("LP Day " + (lsDays - i + 1) + "/" + (lsDays + 1)
                                 + " | " + totalActualRecords + " of ~" + targetRecords + " records received");
                     } else {
-                        appendLog("RLS_SEL_DAY day=-" + i + " NO_DATA");
+                        consecutiveEmptyDays++;
+                        appendLog("RLS_SEL_DAY day=-" + i + " NO_DATA consecutiveEmpty=" + consecutiveEmptyDays);
+                        if (consecutiveEmptyDays >= 2 && i > 3) {
+                            // V37: HDLC stall recovery — after 2+ consecutive empty days the meter's
+                            // HDLC state is likely corrupted by a partial-stall mid-block-transfer.
+                            // drainPort() cleared the Android USB FIFO but the meter still has
+                            // a pending block transfer outstanding.  One reconnect attempt (abort +
+                            // DISC+SNRM+AARQ) resets both sides; if it works, resume from this day.
+                            if (!stalledReconnectDone && !abortRequested) {
+                                stalledReconnectDone = true;
+                                appendLog("RLS_STALL_RECONNECT — " + consecutiveEmptyDays
+                                        + " consecutive empty days; attempting HDLC reconnect at day=-" + i);
+                                try {
+                                    abortPendingBlockTransfer(port);
+                                    drainPort(port);
+                                    AddressInit();
+                                    boolean nrmOk = SetNRM(port, this.bytWait, (byte) 2, this.bytTimOut);
+                                    appendLog("RLS_STALL_RECONNECT_NRM=" + nrmOk);
+                                    if (nrmOk) {
+                                        int aarqRes = AARQ(port, (byte) 1, currentMeterMake.getPassword(),
+                                                this.bytWait, (byte) 3, this.bytTimOut);
+                                        appendLog("RLS_STALL_RECONNECT_AARQ=" + aarqRes);
+                                        if (aarqRes == 0) {
+                                            drainPort(port);
+                                            appendLog("RLS_STALL_RECONNECT_OK — session restored, resuming from day=-" + i);
+                                            consecutiveEmptyDays = 0;
+                                            continue; // retry this day with fresh session
+                                        } else {
+                                            appendLog("RLS_STALL_RECONNECT_AARQ_FAIL — stopping LP");
+                                        }
+                                    } else {
+                                        appendLog("RLS_STALL_RECONNECT_NRM_FAIL — stopping LP");
+                                    }
+                                } catch (Exception ex) {
+                                    appendLog("RLS_STALL_RECONNECT_EX: " + ex.getMessage());
+                                }
+                            }
+                            appendLog("RLS_SEL_EARLY_STOP_NODATA day=-" + i);
+                            break;
+                        }
                     }
                 }
                 appendLog("RLS_SEL_DONE daysWithData=" + selectiveOk + " totalRecords=" + totalActualRecords);
