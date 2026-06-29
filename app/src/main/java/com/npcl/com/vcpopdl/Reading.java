@@ -10981,7 +10981,9 @@ public class Reading extends AppCompatActivity {
                         + " records | ETA ~" + etaStr);
                 boolean stalledReconnectDone = false; // V37: one reconnect attempt per LP read
                 int consecutiveEmptyDays = 0;         // V37: track consecutive NO_DATA days
-                for (int i = lsDays; i >= 0; i--) {
+                // V38: Read newest-first (i=0=today → i=lsDays=oldest) so recent data is
+                // captured before any HDLC stall on older days cuts the session short.
+                for (int i = 0; i <= lsDays; i++) {
                     if (abortRequested) {
                         appendLog("RLS_SEL_ABORT at day=" + i);
                         break;
@@ -11084,7 +11086,7 @@ public class Reading extends AppCompatActivity {
                         // (e.g. 17 of 48 slots for a 30-min meter). We re-request from the last
                         // received timestamp + one interval until the full day is retrieved or the
                         // meter returns no more new records for that day.
-                        int maxPageRetries = 6; // up to 6 continuation pages per day (6×17=102 > 96 max)
+                        int maxPageRetries = 16; // V38: 6→16; Secure returns ~11 records/page so old 6×11=66+10=78 cut off 19:30–23:45 IST; 16×11=176 > 96 max
                         int pagesDone = 0;
                         while (cnt > 0 && cnt < recPerDay && pagesDone < maxPageRetries) {
                             if (abortRequested) break;
@@ -11557,6 +11559,23 @@ public class Reading extends AppCompatActivity {
                         + " (val=" + Long.parseLong(_mpx.substring(2), 16)
                         + ") — Genus LP2 selective-access anomaly, discarding and retrying with LS");
                 DLMdata = null;
+            } else if (midnightEiu > 0) {
+                // V38: Secure meters sometimes return last-block=1 in the HDLC DataBlock header
+                // after the first APDU-worth of data, even when the response is incomplete.
+                // GetParameterSelective stops on last-block=1, yielding a partial array.
+                // GetParameter_LS uses HDLC-segmentation reassembly and gets all records.
+                // Detect partial result by counting actual clock-object timestamps (090c)
+                // in the payload and comparing against EIU.
+                String _selHex = _mp.length >= 4 ? _mp[_mp.length - 1].toLowerCase() : "";
+                int selCount = 0;
+                for (int _si = 0; (_si = _selHex.indexOf("090c", _si)) >= 0; _si += 4) selCount++;
+                if (selCount < midnightEiu) {
+                    appendLog("MIDNIGHT_SEL_PARTIAL selCount=" + selCount + " < EIU=" + midnightEiu
+                            + " — Secure block-transfer truncated; retrying with full buffer read");
+                    DLMdata = null; // fall through to LS fallback below
+                } else {
+                    appendLog("MIDNIGHT_SEL_COMPLETE selCount=" + selCount);
+                }
             }
         }
         if (hasMeaningfulDlmsPayload(DLMdata))
