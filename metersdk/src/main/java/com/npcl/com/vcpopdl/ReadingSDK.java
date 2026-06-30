@@ -1,3 +1,7 @@
+// VERSION: V40 — GetParameterSelective "to" date fix: changed == to .equals() for
+// Until.stringToDateOlnly() comparison (returns new String each call so == was always false,
+// causing else-branch to always encode to=tomorrow, making Genus meters return empty on
+// selective access → MIDNIGHT_SEL_EMPTY → D6=0 in DB) (2026-06-30)
 // VERSION: V39 — ReadInstantData ordering fix: moved Secure compound snapshot (01005E5B00FF)
 // to after all individual D2 registers so the DotNet converter always sees D2 (0003-prefix)
 // lines before the LP buffer; V38 LP newest-first produced a short 01005E5B00FF attr=2
@@ -4653,7 +4657,7 @@ public class ReadingSDK {
         }
         //   appendLog( "Sdate" +Sdate );
         //  appendLog( "dateEndDate" +dateEndDate );
-        if (Until.stringToDateOlnly(dateEndDate) == Until.stringToDateOlnly(Sdate))
+        if (Until.stringToDateOlnly(dateEndDate).equals(Until.stringToDateOlnly(Sdate)))
         {
             byte[] numArray40 = this.nPkt;
             int index9 = (int) num142;
