@@ -1,3 +1,17 @@
+// VERSION: V39 — ReadInstantData ordering fix: moved Secure compound snapshot (01005E5B00FF)
+// to after all individual D2 registers so the DotNet converter always sees D2 (0003-prefix)
+// lines before the LP buffer; V38 LP newest-first produced a short 01005E5B00FF attr=2
+// response (24 bytes vs V37's 700+ bytes) which the converter misinterpreted as
+// array[count=2][struct[29]], consuming all subsequent D2 lines trying to fill 2×29 fields,
+// resulting in D2 absent from XML (2026-06-30)
+// VERSION: V38 — LP newest-first reading: changed selective-access day loop from oldest-first
+// to newest-first so recent days are captured before any HDLC stall on older days cuts the
+// session short; LP maxPageRetries 6→16 so meters returning ~11 records/page (e.g. Secure
+// EHLS3B) now retrieve all 96 intervals/day instead of 78; D6 midnight partial-result
+// detection: after selective access, count actual clock-object (090c) timestamps vs EIU —
+// if partial (e.g. 18<35) fall back to GetParameter_LS which uses HDLC-segmentation
+// reassembly to collect the full buffer; all three fixes are make-agnostic and apply to
+// Secure/Genus/HPL/L&T/AVON/L&G (2026-06-29)
 // VERSION: V35 — REASSOC fix: (1) add AddressInit() before SetNRM() in REASSOC-before-events so I-frame counters reset to 0 after DISC+SNRM (meter was rejecting AARQ with aarqRes=1 because our N(S)!=0 after billing block transfers); (2) add post-billing REASSOC to reset Genus LC001 firmware profile-generic COSEM buffer that stays "active" after 25 billing block transfers (causes midnight/LP attr=2 to return EIU as scalar echo instead of actual buffer) (2026-06-24)
 // VERSION: V34 — GetLocation: replaced GPSTracker with direct LocationManager (GPS→Network→Passive fallback); fixes missing LATITUDE/LONGITUDE in TXT header when getLastKnownLocation() returned null despite GPS on (2026-06-24)
 // VERSION: V33 — ReadEventData: session deadline checked per OBIS iteration so event loop cannot overrun SESSION_MAX_SECONDS (2026-06-23)
@@ -11633,18 +11647,6 @@ public class Reading extends AppCompatActivity {
         DLMdata = this.ReadScalarUnit("INSTANT", port);
         if (hasMeaningfulDlmsPayload(DLMdata)) strbldDLMdata.append(DLMdata);
 
-        // ── Secure compound instantaneous snapshot (01005E5B00FF) ─────────────
-        // This single object contains all instantaneous values for Secure meters.
-        if (isSecureMeter()) {
-            DLMdata = this.GetParameter(port, (byte) 7, "01005E5B00FF", (byte) 3,
-                    this.bytWait, this.bytTryCnt, this.bytTimOut, true, strbldDLMdata);
-            if (hasMeaningfulDlmsPayload(DLMdata)) strbldDLMdata.append(DLMdata);
-
-            DLMdata = this.GetParameter(port, (byte) 7, "01005E5B00FF", (byte) 2,
-                    this.bytWait, this.bytTryCnt, this.bytTimOut, true, strbldDLMdata);
-            if (hasMeaningfulDlmsPayload(DLMdata)) strbldDLMdata.append(DLMdata);
-        }
-
         // ── Standard IS 15959-2 instantaneous registers (.7. value-group) ─────
         // These are CLASS 3 (Register) objects read individually.
         // Confirmed present on Genus LC via power-event snapshots in the billing
@@ -12093,6 +12095,20 @@ public class Reading extends AppCompatActivity {
             if (hasMeaningfulDlmsPayload(DLMdata)) strbldDLMdata.append(DLMdata);
         } // end Genus harmonics + kWh .2.
 
+        // ── Secure compound instantaneous snapshot (01005E5B00FF) ─────────────
+        // V39 FIX: moved here (was before individual D2 registers) so all 0003-prefix
+        // D2 lines appear in the TXT before this 0007-prefix LP buffer object.
+        // The DotNet converter misparses a short attr=2 response (as seen with V38
+        // LP newest-first reads) as array[count=2][struct[29]], consuming all subsequent
+        // D2 lines trying to fill 2×29 fields, resulting in D2 absent from XML (2026-06-30)
+        if (isSecureMeter()) {
+            DLMdata = this.GetParameter(port, (byte) 7, "01005E5B00FF", (byte) 3,
+                    this.bytWait, this.bytTryCnt, this.bytTimOut, true, strbldDLMdata);
+            if (hasMeaningfulDlmsPayload(DLMdata)) strbldDLMdata.append(DLMdata);
+            DLMdata = this.GetParameter(port, (byte) 7, "01005E5B00FF", (byte) 2,
+                    this.bytWait, this.bytTryCnt, this.bytTimOut, true, strbldDLMdata);
+            if (hasMeaningfulDlmsPayload(DLMdata)) strbldDLMdata.append(DLMdata);
+        }
         return strbldDLMdata;
     }
 }
