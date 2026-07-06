@@ -1,3 +1,4 @@
+// VERSION: V41 — extractLastLpTimestamp: added firstPos tracking alongside lastPos; use max(firstTs, lastTs) as pagination base so most-recent-first LP responses (e.g. Secure EHLS3B) correctly advance to the true last record instead of the oldest, eliminating the 4-page overlap re-read and the 16-retry exhaustion on older days; applies to all meter makes (2026-07-06)
 // VERSION: V40 — GetParameterSelective "to" date fix: changed == to .equals() for
 // Until.stringToDateOlnly() comparison (returns new String each call so == was always false,
 // causing else-branch to always encode to=tomorrow, making Genus meters return empty on
@@ -7821,18 +7822,40 @@ public class ReadingSDK {
     private Date extractLastLpTimestamp(String lpHex, int capturePeriodMin) {
         try {
             String lowerHex = lpHex.toLowerCase();
-            // Find all "090c07eX..." date patterns (LP record timestamps)
-            int lastPos = -1;
+            int firstPos = -1, lastPos = -1;
             int idx = 0;
             while (true) {
                 int found = lowerHex.indexOf("090c07e", idx);
                 if (found < 0) break;
+                if (firstPos < 0) firstPos = found;
                 lastPos = found;
                 idx = found + 1;
             }
             if (lastPos < 0) return null;
-            // Decode the timestamp at lastPos (tag=09, len=0C, 12 bytes = 24 hex chars)
-            String ts = lowerHex.substring(lastPos + 4, lastPos + 28); // skip "090c", get 12 bytes
+            Date tFirst = decodeLpTs(lowerHex, firstPos);
+            Date tLast  = decodeLpTs(lowerHex, lastPos);
+            Date base;
+            if (tFirst != null && tLast != null)
+                base = tFirst.after(tLast) ? tFirst : tLast;
+            else if (tFirst != null)
+                base = tFirst;
+            else if (tLast != null)
+                base = tLast;
+            else
+                return null;
+            Calendar cal = Calendar.getInstance();
+            cal.setTime(base);
+            cal.add(Calendar.MINUTE, capturePeriodMin);
+            return cal.getTime();
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    // Decode a DLMS datetime at hex position pos (skips the 4-char "090c" tag+length prefix).
+    private Date decodeLpTs(String lowerHex, int pos) {
+        try {
+            String ts = lowerHex.substring(pos + 4, pos + 28);
             if (ts.length() < 24) return null;
             int y  = Integer.parseInt(ts.substring(0, 4),  16);
             int mo = Integer.parseInt(ts.substring(4, 6),  16); if (mo > 127) mo = 1;
@@ -7840,11 +7863,9 @@ public class ReadingSDK {
             int h  = Integer.parseInt(ts.substring(10, 12),16); if (h  > 127) h  = 0;
             int mi = Integer.parseInt(ts.substring(12, 14),16); if (mi > 127) mi = 0;
             if (y < 2000 || y > 2100 || mo < 1 || mo > 12) return null;
-            // Advance by one capture-period interval
             Calendar cal = Calendar.getInstance();
             cal.set(y, mo - 1, d, h, mi, 0);
             cal.set(Calendar.MILLISECOND, 0);
-            cal.add(Calendar.MINUTE, capturePeriodMin);
             return cal.getTime();
         } catch (Exception ignored) {
             return null;
