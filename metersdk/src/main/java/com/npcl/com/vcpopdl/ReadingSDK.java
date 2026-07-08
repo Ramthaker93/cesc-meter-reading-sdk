@@ -1,3 +1,4 @@
+// VERSION: V43 — HDLC CONTINUATION-FRAME 3-BYTE FIX: Only the FIRST frame of a segmented APDU carries LLC header E6 E7 00; HDLC continuation frames start with raw APDU bytes at bytAddMode+8. Previously all three continuation-frame receive paths unconditionally skipped 3 bytes (LLC header), losing 3 real data bytes per frame boundary → ~10 corrupted LP records/day (proven SS09084148 08-07-2026: 319 malformed records/day, each missing exactly 3 consecutive bytes). Fix: rcvHasLlc() detects LLC presence, llcDataStart() returns correct data start; C4 02 DataBlock guard also protected with rcvHasLlc() check to prevent false positive on raw continuation bytes (2026-07-08)
 // VERSION: V42 — (1) GAP-DRIVEN LP COMPLETION: Secure firmware truncates LP1 attr=2 responses per day (KT152227: midnight + newest 22/day in bulk AND selective; SS09084148: today cut at first block) — forward-only pagination can never fetch the missing middle-of-day records; new lpFillDayGaps() builds a per-day coverage set of received interval timestamps, finds missing slot ranges, and requests exactly those ranges via selective access with an exact end-time override (selEndTimeOverride), marking ranges the meter truly has no data for (outages) as dead to avoid re-requesting; runs after bulk (per-day completeness check seeded from bulk coverage, replaces the old declared>cnt partial-bulk supplement) and inside the selective day loop (replaces forward-only extractLastLpTimestamp pagination). (2) DUPLICATE_SKIPPED-today fix: probe payload made day-0 response a duplicate → continue skipped pagination entirely, leaving today at one page (SS09084148 06-07: 10 records 00:00-02:15 despite meter powered to 18:06) — duplicates now still run gap completion. (3) New reading mode BILLING_EVENT "Billing+Event": identical to Complete minus interval load profile (D4); midnight/daily, billing, events, instantaneous all retained (2026-07-07)
 // VERSION: V41 — extractLastLpTimestamp: added firstPos tracking alongside lastPos; use max(firstTs, lastTs) as pagination base so most-recent-first LP responses (e.g. Secure EHLS3B) correctly advance to the true last record instead of the oldest, eliminating the 4-page overlap re-read and the 16-retry exhaustion on older days; applies to all meter makes (2026-07-06)
 // VERSION: V40 — GetParameterSelective "to" date fix: changed == to .equals() for
@@ -881,6 +882,19 @@ public class ReadingSDK {
     private void lpFrameReceived() {
         lpLastFrameMs = System.currentTimeMillis();
         lpFrameCount++;
+    }
+
+    // V43: true when the received I-frame's information field begins with the LLC header E6 E7.
+    // Only the FIRST frame of a segmented APDU carries LLC; HDLC continuation frames start with
+    // raw APDU bytes at bytAddMode+8.
+    private boolean rcvHasLlc() {
+        int base = (0xff & this.bytAddMode) + 8;
+        return (0xff & this.nRcvPkt[base]) == 0xE6 && (0xff & this.nRcvPkt[base + 1]) == 0xE7;
+    }
+
+    // V43: first index of real APDU data in nRcvPkt — past LLC only if present.
+    private int llcDataStart() {
+        return (0xff & this.bytAddMode) + (rcvHasLlc() ? 11 : 8);
     }
 
     /** Deletes orphaned .TMP files from aborted/crashed readings. */
@@ -5008,7 +5022,10 @@ public class ReadingSDK {
                         // GetRequest(next). These frames arrive here, NOT in while(flag1).
                         // Reading from offset+8 (LLC byte) incorrectly includes LLC header
                         // and full DataBlock headers (~13 bytes) as data garbage.
-                        if ((int)(0xff & this.nRcvPkt[(0xff & this.bytAddMode) + 11]) == 0xC4
+                        // V43: guard with rcvHasLlc() — raw continuation bytes at +11/+12 that
+                        // coincidentally equal C4 02 must not be parsed as DataBlock headers.
+                        if (rcvHasLlc()
+                                && (int)(0xff & this.nRcvPkt[(0xff & this.bytAddMode) + 11]) == 0xC4
                                 && (int)(0xff & this.nRcvPkt[(0xff & this.bytAddMode) + 12]) == 0x02) {
                             // DataBlock frame: update block tracking, read past DataBlock headers
                             num1 = (((long)(this.nRcvPkt[((0xff & this.bytAddMode) + 15)] & 0xFF)) << 24)
@@ -5027,8 +5044,8 @@ public class ReadingSDK {
                                     strbldDLMdata.append(Hex2Digit(this.nRcvPkt[index9]));
                             }
                         } else {
-                            // Plain HDLC continuation segment (no DataBlock headers): skip LLC, read from DLMS start
-                            for (int index9 = ((0xff & this.bytAddMode) + 11); index9 < this.pktLength - 1; ++index9)
+                            // V43: continuation frames have NO LLC — append from the true data start
+                            for (int index9 = llcDataStart(); index9 < this.pktLength - 1; ++index9)
                                 strbldDLMdata.append(Hex2Digit(this.nRcvPkt[index9]));
                         }
                         this.FrameType();
@@ -5304,7 +5321,10 @@ public class ReadingSDK {
                             // For GetResponseDataBlock frames (c4 02), skip LLC+DataBlock headers.
                             // FIX O3: also update flag1/num1 so the outer while(flag1) loop knows
                             // whether more blocks follow — handles L&T window=7 proactive sends.
-                            if ((int)(0xff & this.nRcvPkt[(0xff & this.bytAddMode) + 11]) == 0xC4
+                            // V43: guard with rcvHasLlc() to prevent false DataBlock detection on
+                            // raw continuation bytes that coincidentally equal C4 02.
+                            if (rcvHasLlc()
+                                    && (int)(0xff & this.nRcvPkt[(0xff & this.bytAddMode) + 11]) == 0xC4
                                     && (int)(0xff & this.nRcvPkt[(0xff & this.bytAddMode) + 12]) == 0x02) {
                                 num1 = (((long)(this.nRcvPkt[((0xff & this.bytAddMode) + 15)] & 0xFF)) << 24)
                                         | (((long)(this.nRcvPkt[((0xff & this.bytAddMode) + 16)] & 0xFF)) << 16)
@@ -5322,8 +5342,8 @@ public class ReadingSDK {
                                         strbldDLMdata.append(Hex2Digit(this.nRcvPkt[index64]));
                                 }
                             } else {
-                                // HDLC segment continuation (no application headers): append from LLC byte
-                                for (int index64 = ((0xff & this.bytAddMode) + 11); index64 < this.pktLength - 1; ++index64)
+                                // V43: continuation frames have NO LLC — append from the true data start
+                                for (int index64 = llcDataStart(); index64 < this.pktLength - 1; ++index64)
                                     strbldDLMdata.append(Hex2Digit(this.nRcvPkt[index64]));
                             }
                             this.FrameType();
@@ -6396,7 +6416,10 @@ public class ReadingSDK {
                             // FIX: inner HDLC window loop was appending from bytAddMode+8 which
                             // includes LLC header (e6 e7 00) and DataBlock header (c4 02 ...).
                             // For GetResponseDataBlock frames, skip to the actual data payload.
-                            if ((int)(0xff & this.nRcvPkt[(0xff & this.bytAddMode) + 11]) == 0xC4
+                            // V43: guard with rcvHasLlc() — continuation frames at +11 may
+                            // coincidentally equal C4 02 but are not DataBlock frames.
+                            if (rcvHasLlc()
+                                    && (int)(0xff & this.nRcvPkt[(0xff & this.bytAddMode) + 11]) == 0xC4
                                     && (int)(0xff & this.nRcvPkt[(0xff & this.bytAddMode) + 12]) == 0x02) {
                                 if ((int)(0xff & this.nRcvPkt[(int) this.bytAddMode + 20]) == 130) {
                                     for (int index21 = ((0xff & this.bytAddMode) + 23); index21 < this.pktLength - 1; ++index21)
@@ -6409,8 +6432,8 @@ public class ReadingSDK {
                                         strbldDLMdata.append(Hex2Digit(this.nRcvPkt[index21]));
                                 }
                             } else {
-                                // Non-DataBlock I-frame: skip 3-byte LLC header, append DLMS APDU
-                                for (int index21 = ((0xff & this.bytAddMode) + 11); index21 < this.pktLength - 1; ++index21)
+                                // V43: continuation frames have NO LLC — append from the true data start
+                                for (int index21 = llcDataStart(); index21 < this.pktLength - 1; ++index21)
                                     strbldDLMdata.append(Hex2Digit(this.nRcvPkt[index21]));
                             }
                             myLogic = true;
