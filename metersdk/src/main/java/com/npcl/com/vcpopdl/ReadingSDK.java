@@ -1,3 +1,4 @@
+// VERSION: V44 — (1) PHASE ORDER: NamePlate -> Instantaneous -> Billing -> Midnight -> Events -> Load Profile (LP moved LAST for all modes where applicable). LP is the longest, most failure-prone phase (Secure firmware stalls kill the HDLC link); billing/midnight/events are now secured while the link is healthy, and LP gets ALL remaining session time (90s billing+events reserve removed, lpDeadlineMs = sessionDeadlineMs). REASSOC_POST_BILLING resets COSEM after billing block transfers BEFORE the profile-generic reads (midnight/LP) - watch Genus results since LC001 firmware buffer state survives REASSOC (V35). (2) SAVE-TILL-BILLING: in Complete/Billing+Event mode the TXT is now SAVED whenever phases through Billing completed (phaseBillingReached), even if midnight/events/LP failed or the user aborted mid-LP (MakeDataFile ABORT_OVERRIDE) - 08-07 four aborted sessions each discarded 2262 good LP records (2026-07-08)
 // VERSION: V43 — HDLC CONTINUATION-FRAME 3-BYTE FIX: Only the FIRST frame of a segmented APDU carries LLC header E6 E7 00; HDLC continuation frames start with raw APDU bytes at bytAddMode+8. Previously all three continuation-frame receive paths unconditionally skipped 3 bytes (LLC header), losing 3 real data bytes per frame boundary → ~10 corrupted LP records/day (proven SS09084148 08-07-2026: 319 malformed records/day, each missing exactly 3 consecutive bytes). Fix: rcvHasLlc() detects LLC presence, llcDataStart() returns correct data start; C4 02 DataBlock guard also protected with rcvHasLlc() check to prevent false positive on raw continuation bytes (2026-07-08)
 // VERSION: V42 — (1) GAP-DRIVEN LP COMPLETION: Secure firmware truncates LP1 attr=2 responses per day (KT152227: midnight + newest 22/day in bulk AND selective; SS09084148: today cut at first block) — forward-only pagination can never fetch the missing middle-of-day records; new lpFillDayGaps() builds a per-day coverage set of received interval timestamps, finds missing slot ranges, and requests exactly those ranges via selective access with an exact end-time override (selEndTimeOverride), marking ranges the meter truly has no data for (outages) as dead to avoid re-requesting; runs after bulk (per-day completeness check seeded from bulk coverage, replaces the old declared>cnt partial-bulk supplement) and inside the selective day loop (replaces forward-only extractLastLpTimestamp pagination). (2) DUPLICATE_SKIPPED-today fix: probe payload made day-0 response a duplicate → continue skipped pagination entirely, leaving today at one page (SS09084148 06-07: 10 records 00:00-02:15 despite meter powered to 18:06) — duplicates now still run gap completion. (3) New reading mode BILLING_EVENT "Billing+Event": identical to Complete minus interval load profile (D4); midnight/daily, billing, events, instantaneous all retained (2026-07-07)
 // VERSION: V41 — extractLastLpTimestamp: added firstPos tracking alongside lastPos; use max(firstTs, lastTs) as pagination base so most-recent-first LP responses (e.g. Secure EHLS3B) correctly advance to the true last record instead of the oldest, eliminating the 4-page overlap re-read and the 16-retry exhaustion on older days; applies to all meter makes (2026-07-06)
@@ -192,6 +193,9 @@ public class ReadingSDK {
     // Phase completion flags for COMPLETE mode
     private volatile boolean phasePartialLp      = false;
     private volatile boolean phasePartialBilling = false;
+    // V44: true once the billing phase has executed — the TXT is worth saving
+    // even if later phases (midnight/events/LP) fail or the user aborts.
+    private volatile boolean phaseBillingReached = false;
 
     // Consecutive SendPkt failure counter
     private int consecutiveSendFailures = 0;
@@ -242,6 +246,7 @@ public class ReadingSDK {
         lpPhaseStartMs = 0;
         phasePartialLp = false;
         phasePartialBilling = false;
+        phaseBillingReached = false; // V44
         cleanupTmpFiles(); // remove any .TMP from a previous crashed/aborted session
         currentMeterMake = meterMake;
         final String finalFileName = (fileName != null && !fileName.trim().isEmpty())
@@ -666,141 +671,141 @@ public class ReadingSDK {
                         fireProgress(callback, "✓ Instantaneous done (" + (tInstElapsed/1000) + "s)", 38);
                         UpdateStatus(CescRajMeterno, "Instantaneous OK");
 
-                        // ── Phase 2: Midnight Snapshot ────────────────────────────────────
-                        // READ BEFORE BILLING: Genus LC001 firmware's profile-generic COSEM
-                        // buffer object becomes unresponsive after billing's 25 block-transfers.
-                        // DISC+SNRM+AARQ (REASSOC_POST_BILLING) is insufficient to reset the
-                        // firmware's internal LP/midnight buffer tracking state.  Reading these
-                        // phases in clean COSEM state (before billing) matches the original
-                        // pre-optimization MRI reading order which correctly returns 4297 records.
+                        // ── V44 PHASE ORDER: Billing → Midnight → Events → LP (LAST) ────
+                        // LP is the longest and most failure-prone phase (Secure firmware
+                        // stalls kill the HDLC link). Reading billing/midnight/events FIRST
+                        // secures them while the link is healthy; if LP dies at the end the
+                        // TXT still carries everything else. NOTE: Genus LC001 firmware may
+                        // leave its profile-generic buffer unresponsive after billing block
+                        // transfers (V35) — REASSOC_POST_BILLING below resets the session
+                        // before the profile-generic reads; watch Genus midnight/LP results.
                         if (System.currentTimeMillis() >= sessionDeadlineMs) {
-                            appendLog("SESSION_SKIP_MIDNIGHT: session deadline reached after Instantaneous");
-                            fireProgress(callback, "WARN: Session limit reached — skipping Midnight+LP+Billing+Events", 79);
+                            appendLog("SESSION_SKIP_ALL: session deadline reached after Instantaneous");
+                            fireProgress(callback, "WARN: Session limit reached — skipping Billing+Midnight+Events+LP", 79);
                         } else {
-                            bytTimOut = fastTimOut;
-                            bytTryCnt = fastTryCnt;
-                            long tMidStart = System.currentTimeMillis();
-                            fireProgress(callback, "Downloading Midnight Snapshot... (5-10s)", 40);
-                            MeterData.append(ReadMidnightSnapshot(port, lsDays));
-                            long tMidElapsed = System.currentTimeMillis() - tMidStart;
-                            fireProgress(callback, "✓ Midnight done (" + (tMidElapsed/1000) + "s)", 46);
-                            UpdateStatus(CescRajMeterno, "Midnight OK");
+                            // ── Phase 2: Billing ─────────────────────────────────────────
+                            bytTimOut = billingTimOut;
+                            bytTryCnt = billingTryCnt;
+                            drainPort(port);
+                            android.os.SystemClock.sleep(150);
+                            long tBillStart = System.currentTimeMillis();
+                            fireProgress(callback, "Downloading Billing data... (15-30s)", 40);
+                            StringBuilder billingData = ReadBillingData(port, readingMode);
+                            MeterData.append(billingData);
+                            long tBillElapsed = System.currentTimeMillis() - tBillStart;
+                            appendLog("BILLING_DONE elapsed=" + tBillElapsed + "ms");
+                            phaseBillingReached = true; // V44: TXT is save-worthy from here on
                             flushLog();
-
-                            // ── Phase 3: Load Profile ─────────────────────────────────────
-                            // READ BEFORE BILLING — same reason as midnight above.
-                            // Reserve 90s for billing (up to 60s) + events (30s) buffer.
-                            // Floor at 60s: if we have less than 60s left, LP is skipped.
-                            // Hard cap at 300s (5 min) to leave billing+events headroom.
-                            long lpRemaining = sessionDeadlineMs - System.currentTimeMillis() - 90000L;
-                            if (readingMode == ReadingMode.BILLING_EVENT) {
-                                // V42: Billing+Event mode — interval LP intentionally not read.
-                                appendLog("LP_SKIP mode=Billing+Event — interval load profile not requested");
-                                fireProgress(callback, "Load Profile skipped (Billing+Event mode)", 50);
-                            } else if (lpRemaining < 60000L) {
-                                appendLog("SESSION_SKIP_LP: only " + (lpRemaining/1000) + "s remaining — insufficient for LP");
-                                fireProgress(callback, "WARN: ⚠ Insufficient time for Load Profile — skipping", 50);
+                            if (billingData != null && billingData.length() > 0) {
+                                fireProgress(callback, "✓ Billing done (" + (tBillElapsed/1000) + "s)", 46);
+                                UpdateStatus(CescRajMeterno, "Billing OK");
                             } else {
-                                bytTimOut = (byte) 8;
-                                bytTryCnt = (byte) 2;
-                                // lpDeadlineMs = session reserve boundary (not a hard budget cap)
-                                lpDeadlineMs   = sessionDeadlineMs - 90_000L;
-                                lpLastFrameMs  = 0;
-                                lpFrameCount   = 0;
-                                lpPhaseStartMs = System.currentTimeMillis();
-                                fireProgress(callback, "Downloading Load Profile… (idle-abort after 45s silence)", 48);
-                                appendLog("LP_START days=auto bytTimOut=" + bytTimOut + " bytTryCnt=" + bytTryCnt
-                                        + " idleTimeout=45s sessionReserve=" + (lpRemaining/1000) + "s");
-                                MeterData.append(ReadLoadSurveyData(port, lsDays));
-                                long lpElapsed = System.currentTimeMillis() - lpPhaseStartMs;
-                                long lpKb      = strbldDLMdata.length() / 2048L;
-                                boolean lpIdleHit    = lpLastFrameMs > 0
-                                        && System.currentTimeMillis() - lpLastFrameMs > LP_IDLE_MS;
-                                boolean lpSessionHit = System.currentTimeMillis() > lpDeadlineMs;
-                                phasePartialLp = (lpIdleHit && lpFrameCount > 0)
-                                        || (lpSessionHit && lpFrameCount > 0)
-                                        || (lpSessionHit && lpFrameCount == 0);
-                                appendLog("LP_END elapsed=" + lpElapsed + "ms frames=" + lpFrameCount
-                                        + " kb=" + lpKb + " idleHit=" + lpIdleHit + " sessionHit=" + lpSessionHit);
-                                if (phasePartialLp) {
-                                    String reason = (lpFrameCount == 0) ? "no response"
-                                            : lpIdleHit ? "meter idle" : "session cap";
-                                    fireProgress(callback, "WARN: ⚠ LP partial — " + lpFrameCount + " fr (" + reason + ") " + (lpElapsed/1000) + "s", 64);
-                                } else {
-                                    fireProgress(callback, "✓ Load Profile — " + lpFrameCount + " fr · " + lpKb + " kB (" + (lpElapsed/1000) + "s)", 64);
-                                }
-                                flushLog();
-                                lpDeadlineMs = 0;
+                                phasePartialBilling = true;
+                                fireProgress(callback, "WARN: Billing empty — new meter or no billing cycle yet (" + (tBillElapsed/1000) + "s)", 46);
+                                appendLog("BILLING_WARN: Billing section empty — meter may not have completed a billing cycle");
+                                UpdateStatus(CescRajMeterno, "Billing FAILED");
                             }
 
-                            // ── Phase 4: Billing ──────────────────────────────────────────
-                            // Moved AFTER midnight+LP so billing's 25 block-transfers cannot
-                            // corrupt the Genus firmware's profile-generic buffer state.
-                            if (System.currentTimeMillis() >= sessionDeadlineMs) {
-                                appendLog("SESSION_SKIP_BILLING: session deadline reached after LP");
-                                fireProgress(callback, "WARN: Session limit reached — skipping Billing+Events", 79);
-                            } else {
-                                bytTimOut = billingTimOut;
-                                bytTryCnt = billingTryCnt;
-                                drainPort(port);
-                                android.os.SystemClock.sleep(150);
-                                long tBillStart = System.currentTimeMillis();
-                                fireProgress(callback, "Downloading Billing data... (15-30s)", 66);
-                                StringBuilder billingData = ReadBillingData(port, readingMode);
-                                MeterData.append(billingData);
-                                long tBillElapsed = System.currentTimeMillis() - tBillStart;
-                                appendLog("BILLING_DONE elapsed=" + tBillElapsed + "ms");
-                                flushLog();
-                                if (billingData != null && billingData.length() > 0) {
-                                    fireProgress(callback, "✓ Billing done (" + (tBillElapsed/1000) + "s)", 72);
-                                    UpdateStatus(CescRajMeterno, "Billing OK");
-                                } else {
-                                    fireProgress(callback, "WARN: Billing empty — check meter (" + (tBillElapsed/1000) + "s)", 72);
-                                    appendLog("BILLING_WARN: Billing section empty in COMPLETE mode");
-                                    UpdateStatus(CescRajMeterno, "Billing FAILED");
-                                }
-
-                                // ── REASSOC after billing / before events ─────────────────
-                                // Billing's block-transfers exhaust the COSEM session state.
-                                // Re-establish association before events (previously two separate
-                                // REASSOC blocks — REASSOC_POST_BILLING and REASSOC-before-events
-                                // — now merged into one at the correct position).
-                                if (!abortRequested && System.currentTimeMillis() < sessionDeadlineMs) {
-                                    appendLog("REASSOC_PRE_EVENTS — resetting COSEM after billing block transfers");
-                                    try {
-                                        drainPort(port);
-                                        android.os.SystemClock.sleep(200);
-                                        AddressInit();
-                                        boolean nrmPre = SetNRM(port, bytWait, (byte) 2, bytTimOut);
-                                        if (nrmPre) {
-                                            int aarqPre = AARQ(port, (byte) 1, dlmsPassword,
-                                                    bytWait, (byte) 2, bytTimOut);
-                                            appendLog("REASSOC_PRE_EVENTS_"
-                                                    + (aarqPre == 0 ? "OK" : "FAIL aarqRes=" + aarqPre));
-                                            if (aarqPre == 0) drainPort(port);
-                                        } else {
-                                            appendLog("REASSOC_PRE_EVENTS_NRM_FAIL — events may be incomplete");
-                                        }
-                                    } catch (Exception rpbEx) {
-                                        appendLog("REASSOC_PRE_EVENTS_EX: " + rpbEx.getMessage());
+                            // ── REASSOC after billing / before profile-generic reads ─────
+                            // Genus LC001: billing's 25 block transfers can leave the
+                            // profile-generic COSEM buffer unresponsive; reset the session
+                            // BEFORE midnight/LP (both are profile-generic objects).
+                            if (!abortRequested && System.currentTimeMillis() < sessionDeadlineMs) {
+                                appendLog("REASSOC_POST_BILLING — resetting COSEM before profile-generic reads");
+                                try {
+                                    drainPort(port);
+                                    android.os.SystemClock.sleep(200);
+                                    AddressInit();
+                                    boolean nrmPre = SetNRM(port, bytWait, (byte) 2, bytTimOut);
+                                    if (nrmPre) {
+                                        int aarqPre = AARQ(port, (byte) 1, dlmsPassword,
+                                                bytWait, (byte) 2, bytTimOut);
+                                        appendLog("REASSOC_POST_BILLING_"
+                                                + (aarqPre == 0 ? "OK" : "FAIL aarqRes=" + aarqPre));
+                                        if (aarqPre == 0) drainPort(port);
+                                    } else {
+                                        appendLog("REASSOC_POST_BILLING_NRM_FAIL — midnight/LP may be incomplete");
                                     }
+                                } catch (Exception rpbEx) {
+                                    appendLog("REASSOC_POST_BILLING_EX: " + rpbEx.getMessage());
                                 }
+                            }
 
-                                // ── Phase 5: Events ───────────────────────────────────────
+                            // ── Phase 3: Midnight Snapshot ───────────────────────────────
+                            if (System.currentTimeMillis() >= sessionDeadlineMs) {
+                                appendLog("SESSION_SKIP_MIDNIGHT: session deadline reached after Billing");
+                                fireProgress(callback, "WARN: Session limit reached — skipping Midnight+Events+LP", 79);
+                            } else {
+                                bytTimOut = fastTimOut;
+                                bytTryCnt = fastTryCnt;
+                                long tMidStart = System.currentTimeMillis();
+                                fireProgress(callback, "Downloading Midnight Snapshot... (5-10s)", 48);
+                                MeterData.append(ReadMidnightSnapshot(port, lsDays));
+                                long tMidElapsed = System.currentTimeMillis() - tMidStart;
+                                fireProgress(callback, "✓ Midnight done (" + (tMidElapsed/1000) + "s)", 52);
+                                UpdateStatus(CescRajMeterno, "Midnight OK");
+                                flushLog();
+
+                                // ── Phase 4: Events ──────────────────────────────────────
                                 if (System.currentTimeMillis() >= sessionDeadlineMs) {
-                                    appendLog("SESSION_SKIP_EVENTS: session deadline reached — skipping events");
-                                    fireProgress(callback, "WARN: ⚠ Session limit reached — Events skipped", 79);
+                                    appendLog("SESSION_SKIP_EVENTS: session deadline reached — skipping events+LP");
+                                    fireProgress(callback, "WARN: ⚠ Session limit reached — Events+LP skipped", 79);
                                 } else {
                                     bytTimOut = fastTimOut;
                                     bytTryCnt = fastTryCnt;
                                     long tEvtStart = System.currentTimeMillis();
-                                    fireProgress(callback, "Downloading Events... (10-20s)", 74);
+                                    fireProgress(callback, "Downloading Events... (10-20s)", 54);
                                     MeterData.append(ReadEventData(port));
                                     long tEvtElapsed = System.currentTimeMillis() - tEvtStart;
-                                    fireProgress(callback, "✓ Events done (" + (tEvtElapsed/1000) + "s)", 79);
-                                }
-                            } // end Billing+Events
-                        } // end Midnight+LP+Billing+Events
+                                    fireProgress(callback, "✓ Events done (" + (tEvtElapsed/1000) + "s)", 58);
+
+                                    // ── Phase 5: Load Profile (LAST) ─────────────────────
+                                    // LP now gets ALL remaining session time — no reserve
+                                    // needed since nothing runs after it. Idle-abort (45s
+                                    // silence) still detects a stuck meter early.
+                                    long lpRemaining = sessionDeadlineMs - System.currentTimeMillis();
+                                    if (readingMode == ReadingMode.BILLING_EVENT) {
+                                        // V42: Billing+Event mode — interval LP intentionally not read.
+                                        appendLog("LP_SKIP mode=Billing+Event — interval load profile not requested");
+                                        fireProgress(callback, "Load Profile skipped (Billing+Event mode)", 60);
+                                    } else if (lpRemaining < 60000L) {
+                                        appendLog("SESSION_SKIP_LP: only " + (lpRemaining/1000) + "s remaining — insufficient for LP");
+                                        fireProgress(callback, "WARN: ⚠ Insufficient time for Load Profile — skipping", 60);
+                                    } else {
+                                        bytTimOut = (byte) 8;
+                                        bytTryCnt = (byte) 2;
+                                        // V44: LP is the final phase — deadline = full session deadline
+                                        lpDeadlineMs   = sessionDeadlineMs;
+                                        lpLastFrameMs  = 0;
+                                        lpFrameCount   = 0;
+                                        lpPhaseStartMs = System.currentTimeMillis();
+                                        fireProgress(callback, "Downloading Load Profile… (idle-abort after 45s silence)", 62);
+                                        appendLog("LP_START days=auto bytTimOut=" + bytTimOut + " bytTryCnt=" + bytTryCnt
+                                                + " idleTimeout=45s sessionReserve=" + (lpRemaining/1000) + "s");
+                                        MeterData.append(ReadLoadSurveyData(port, lsDays));
+                                        long lpElapsed = System.currentTimeMillis() - lpPhaseStartMs;
+                                        long lpKb      = strbldDLMdata.length() / 2048L;
+                                        boolean lpIdleHit    = lpLastFrameMs > 0
+                                                && System.currentTimeMillis() - lpLastFrameMs > LP_IDLE_MS;
+                                        boolean lpSessionHit = System.currentTimeMillis() > lpDeadlineMs;
+                                        phasePartialLp = (lpIdleHit && lpFrameCount > 0)
+                                                || (lpSessionHit && lpFrameCount > 0)
+                                                || (lpSessionHit && lpFrameCount == 0);
+                                        appendLog("LP_END elapsed=" + lpElapsed + "ms frames=" + lpFrameCount
+                                                + " kb=" + lpKb + " idleHit=" + lpIdleHit + " sessionHit=" + lpSessionHit);
+                                        if (phasePartialLp) {
+                                            String reason = (lpFrameCount == 0) ? "no response"
+                                                    : lpIdleHit ? "meter idle" : "session cap";
+                                            fireProgress(callback, "WARN: ⚠ LP partial — " + lpFrameCount + " fr (" + reason + ") " + (lpElapsed/1000) + "s", 78);
+                                        } else {
+                                            fireProgress(callback, "✓ Load Profile — " + lpFrameCount + " fr · " + lpKb + " kB (" + (lpElapsed/1000) + "s)", 78);
+                                        }
+                                        flushLog();
+                                        lpDeadlineMs = 0;
+                                    }
+                                } // end Events+LP
+                            } // end Midnight+Events+LP
+                        } // end Billing+Midnight+Events+LP
 
                         // ── Session summary ──────────────────────────────────────────────
                         long sessionElapsed = System.currentTimeMillis() - sessionStartMs;
@@ -3891,8 +3896,15 @@ public class ReadingSDK {
      */
     public String MakeDataFile(String FileName, String Data) {
         if (abortRequested) {
-            appendLog("MakeDataFile SKIP: abortRequested — partial file not written");
-            return "";
+            // V44: abort during a late phase (midnight/events/LP) must not discard
+            // nameplate+instant+billing already captured (08-07: 4 aborts lost 2262
+            // LP records each). Save whenever the billing phase was reached.
+            if (phaseBillingReached) {
+                appendLog("MakeDataFile ABORT_OVERRIDE: abortRequested after Billing phase — file saved with captured data");
+            } else {
+                appendLog("MakeDataFile SKIP: abortRequested — partial file not written");
+                return "";
+            }
         }
         File tmpFile = null;
         try {
