@@ -1,3 +1,4 @@
+// VERSION: V48 — DEADLINE SPIN-LOOP HANG FIX (09-07 17:03 V47 Genus read: log ends exactly at the 780s deadline mid-request, session then hung SILENTLY ~7 min until user abort; TXT never saved, 23 days of data lost): TWO receive loops in GetParameterSelective break their inner loop on lpShouldAbort() but never release the outer retry loop, which resends the RR and spins forever (log flood unflushed) — (a) FIX-O4 RR loop: num121=nTryCount on abort (SEL_RR_DEADLINE), (b) SEG RR loop: num197=nTryCount + flag1=false (GPLS_SEG_ABORT '— loops released'); same bug class the GPLS_SEL_BLOCK_ABORT comment fixed earlier, missed in these two. MAKE-AGNOSTIC: these loops serve every make (the RR path exists for L&T window=7), so any make crossing the deadline mid-segment would hang identically. ALSO: (c) desync retry now settles 250ms + drains twice (echoed frame can still be in flight at first drain — 17:03 log shows repeat desyncs retry=2/3 on the same gap); (d) EARLY entry-numbering probes right after attr7 (LP_ENTRY_PROBE_TOP/BOTTOM, ~2s, harmless) — collects the per-make entry semantics even when LP dies later, which the 17:03 abort prevented. V47 desync guard verified working (correct detection + recovery each time, RLS_GAP_DONE follows).
 // VERSION: V47b — ENTRY-ACCESS FALLBACK: LP1 GetParameterSelective supports access selector 2 (read-by-entry-number) via selEntryFrom/selEntryTo fields and new lpGetByEntry() wrapper. After the day loop, when coverage ends >1 day short of the lsDays window, LP_ENTRY_FALLBACK sweeps the remainder by entry number newest→oldest in recPerDay chunks. Bypasses the meter's time-range engine (which the 09-07 logs show dying ~8 days back on Secure). Bounded 60 pages, 2 consecutive empty stops, ensureSessionAlive first, failures harmless (2026-07-09)
 // VERSION: V47 — STALE-RESPONSE DESYNC GUARD: in lpFillDayGaps, when a response's every timestamp predates the requested window (stale late-retransmission from prior timeout), abort+drain and retry the same gap WITHOUT consuming a ladder attempt (max 4 desync recoveries/day). SESSION_END/OVERRUN now compares against the scaled sessionMaxSecs instead of the base SESSION_MAX_SECONDS constant — fixes false overrun log on 09-07 15:29 where 670s>540s was printed while real cap was 780s (2026-07-09)
 // VERSION: V46 — (1) collectLpTimestamps STRICT: clock only counts when preceded by intact struct head '02 <fieldcount>' — mangled-head records (single-frame offset bug) no longer falsely mark gap slots covered, so 3-attempt ladder fires and recovers the dropped record. (2) hasLoadProfileRecords accepts SINGLE intact record: old >=2 loose 090c rule discarded 1-record refill responses from gap ladder. (3) countIntactLpRecords new method: strict '02'-prefixed clock count used in mergeLpPageHexList to stop header totals from overstating. (4) Tail gaps get max 2 attempts vs 3 for interior gaps — cuts Genus truncated-day timeout waste. (5) NO-RESPONSE gap request: abortPendingBlockTransfer+drainPort before next attempt — pending transfer was poisoning subsequent days into empty arrays and early-stop. (6) EMPTY_SKIPPED consecutive days now attempt one-shot stall reconnect before RLS_SEL_EARLY_STOP_EMPTY (reconnect existed only in NO_DATA branch). (7) Session scaling: sessionMaxSecs = min(900, BASE + (lsDays-15)*12) for lsDays>15 — Genus 36-day reads were cut at day 28/36 by 540s cap (2026-07-09)
@@ -6526,6 +6527,11 @@ public class Reading extends AppCompatActivity {
                 {
                     if (lpShouldAbort()) {
                         flag3 = false;
+                        // V48: force the OUTER retry loop to exit too — without this the
+                        // outer while(!flag3 && num121 < nTryCount) resent the RR and spun
+                        // forever once the deadline passed
+                        num121 = nTryCount;
+                        appendLog("SEL_RR_DEADLINE — outer RR loop released");
                         break;
                     }
                     this.DataReceive(port);
@@ -6821,7 +6827,13 @@ public class Reading extends AppCompatActivity {
                         // segment does not block indefinitely.
                         if (lpShouldAbort()) {
                             flag4 = false;
-                            appendLog("GPLS_SEG_ABORT block=" + num1);
+                            // V48: release BOTH enclosing loops — without num197=nTryCount
+                            // the outer do-while resent the RR and spun forever after the
+                            // deadline (silent 7+ min hang, 09-07 17:16 log). flag1=false
+                            // stops the while(flag1) block loop as well.
+                            num197 = nTryCount;
+                            flag1 = false;
+                            appendLog("GPLS_SEG_ABORT block=" + num1 + " — loops released");
                             break;
                         }
 
@@ -9704,6 +9716,12 @@ public class Reading extends AppCompatActivity {
                     try {
                         abortPendingBlockTransfer(port);
                         drainPort(port);
+                        // V48: the echoed frame may still be in flight when the first
+                        // drain runs (09-07 17:03 log: repeat desyncs on the same gap,
+                        // retry=2/3) — settle briefly and drain again so the retry
+                        // starts on a truly quiet line.
+                        Thread.sleep(250);
+                        drainPort(port);
                     } catch (Exception ignored) {}
                     continue;
                 }
@@ -11173,6 +11191,33 @@ public class Reading extends AppCompatActivity {
         }
         appendLog("RLS_ENTRIES_IN_USE=" + entriesInUse);
 
+        // V48: EARLY entry-numbering probes (~2s total). The entry-access fallback
+        // needs each make's entry semantics (direction, whether attr7 is honest —
+        // Secure reports 452 while holding 28+ days), but the 09-07 17:03 read died
+        // before ever reaching the fallback, so no field data was collected. Probe
+        // NOW, right after attr7, while the link is fresh: one page at the reported
+        // top and one at the bottom, clocks logged. Failures are harmless.
+        if (entriesInUse > 0 && !abortRequested && !lpShouldAbort()) {
+            try {
+                StringBuilder pTop = lpGetByEntry(port, Math.max(1, entriesInUse - 2), entriesInUse, capturePeriodMin);
+                String pTopHex = (pTop == null) ? "" : pTop.toString().trim();
+                java.util.TreeSet<Long> topSlots = new java.util.TreeSet<>();
+                if (!pTopHex.isEmpty()) collectLpTimestamps(pTopHex, topSlots);
+                appendLog("LP_ENTRY_PROBE_TOP entries=" + Math.max(1, entriesInUse - 2) + ".." + entriesInUse
+                        + " records=" + topSlots.size()
+                        + (topSlots.isEmpty() ? "" : (" clocks=" + new java.util.Date(topSlots.first())
+                                + ".." + new java.util.Date(topSlots.last()))));
+                StringBuilder pBot = lpGetByEntry(port, 1, 3, capturePeriodMin);
+                String pBotHex = (pBot == null) ? "" : pBot.toString().trim();
+                java.util.TreeSet<Long> botSlots = new java.util.TreeSet<>();
+                if (!pBotHex.isEmpty()) collectLpTimestamps(pBotHex, botSlots);
+                appendLog("LP_ENTRY_PROBE_BOTTOM entries=1..3 records=" + botSlots.size()
+                        + (botSlots.isEmpty() ? "" : (" clocks=" + new java.util.Date(botSlots.first())
+                                + ".." + new java.util.Date(botSlots.last()))));
+            } catch (Exception probeEx) {
+                appendLog("LP_ENTRY_PROBE_EX: " + probeEx.getMessage());
+            }
+        }
 
         // ----------------------------------------------------------------
         // STEP 4 – Calculate records needed and decide read strategy
