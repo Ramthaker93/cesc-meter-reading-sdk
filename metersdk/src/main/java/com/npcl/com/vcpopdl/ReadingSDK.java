@@ -10293,7 +10293,6 @@ public class ReadingSDK {
                             + (allGot.isEmpty() ? "none" : String.valueOf(new Date(oldestGotMs)))
                             + " target=" + new Date(wantOldestMs)
                             + " EIU=" + entriesInUse + " sweepFrom=" + entryHi);
-                    ensureSessionAlive(port, "LP_ENTRY");
                     final int MAX_ENTRY_PAGES = 60;
                     int entryPages = 0, entryAdded = 0, entryEmpty = 0;
                     long hi = entryHi;

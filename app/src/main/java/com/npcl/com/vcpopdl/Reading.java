@@ -11774,7 +11774,6 @@ public class Reading extends AppCompatActivity {
                             + (allGot.isEmpty() ? "none" : String.valueOf(new java.util.Date(oldestGotMs)))
                             + " target=" + new java.util.Date(wantOldestMs)
                             + " EIU=" + entriesInUse + " sweepFrom=" + entryHi);
-                    ensureSessionAlive(port, "LP_ENTRY");
                     final int MAX_ENTRY_PAGES = 60;
                     int entryPages = 0, entryAdded = 0, entryEmpty = 0;
                     long hi = entryHi;
