@@ -1,3 +1,4 @@
+// VERSION: V46 — (1) collectLpTimestamps STRICT: clock only counts when preceded by intact struct head '02 <fieldcount>' — mangled-head records (single-frame offset bug) no longer falsely mark gap slots covered, so 3-attempt ladder fires and recovers the dropped record. (2) hasLoadProfileRecords accepts SINGLE intact record: old >=2 loose 090c rule discarded 1-record refill responses from gap ladder. (3) countIntactLpRecords new method: strict '02'-prefixed clock count used in mergeLpPageHexList to stop header totals from overstating. (4) Tail gaps get max 2 attempts vs 3 for interior gaps — cuts Genus truncated-day timeout waste. (5) NO-RESPONSE gap request: abortPendingBlockTransfer+drainPort before next attempt — pending transfer was poisoning subsequent days into empty arrays and early-stop. (6) EMPTY_SKIPPED consecutive days now attempt one-shot stall reconnect before RLS_SEL_EARLY_STOP_EMPTY (reconnect existed only in NO_DATA branch). (7) Session scaling: sessionMaxSecs = min(900, BASE + (lsDays-15)*12) for lsDays>15 — Genus 36-day reads were cut at day 28/36 by 540s cap (2026-07-09)
 // VERSION: V45 — (1) lastSelHadResponse flag: only confirmed-empty-array responses count for cross-day dead-slot learning — HDLC timeouts never poison gap tracking. (2) 3-attempt escalation ladder per gap: exact range (atpt1) → widened ±1 interval (atpt2) → shifted window 8 intervals earlier to day-end (atpt3) repositions missing slot away from block boundary (Secure drops last record at each block boundary; Genus bulk truncates at first block). (3) Cross-day dead-slot learning gated on confirmed meter response, not timeout. (4) Widened-request response containing ONLY already-seen timestamps escalates without appending duplicate page. (5) LP_PAGE_AUDIT on every accepted page: declared vs actual record count + timestamp range + ***LOST=n*** marker. (6) mergeLpPageHexList header count = actual records present not sum of declared counts. (7) MAX_GAP_PAGES 16→24 for Genus multi-block day recovery (2026-07-09)
 // VERSION: V44 — (1) PHASE ORDER: NamePlate -> Instantaneous -> Billing -> Midnight -> Events -> Load Profile (LP moved LAST for all modes where applicable). LP is the longest, most failure-prone phase (Secure firmware stalls kill the HDLC link); billing/midnight/events are now secured while the link is healthy, and LP gets ALL remaining session time (90s billing+events reserve removed, lpDeadlineMs = sessionDeadlineMs). REASSOC_POST_BILLING resets COSEM after billing block transfers BEFORE the profile-generic reads (midnight/LP) - watch Genus results since LC001 firmware buffer state survives REASSOC (V35). (2) SAVE-TILL-BILLING: in Complete/Billing+Event mode the TXT is now SAVED whenever phases through Billing completed (phaseBillingReached), even if midnight/events/LP failed or the user aborted mid-LP (MakeDataFile ABORT_OVERRIDE) - 08-07 four aborted sessions each discarded 2262 good LP records (2026-07-08)
 // VERSION: V43 — HDLC CONTINUATION-FRAME 3-BYTE FIX: Only the FIRST frame of a segmented APDU carries LLC header E6 E7 00; HDLC continuation frames start with raw APDU bytes at bytAddMode+8. Previously all three continuation-frame receive paths unconditionally skipped 3 bytes (LLC header), losing 3 real data bytes per frame boundary → ~10 corrupted LP records/day (proven SS09084148 08-07-2026: 319 malformed records/day, each missing exactly 3 consecutive bytes). Fix: rcvHasLlc() detects LLC presence, llcDataStart() returns correct data start; C4 02 DataBlock guard also protected with rcvHasLlc() check to prevent false positive on raw continuation bytes (2026-07-08)
@@ -1363,13 +1364,20 @@ public class Reading extends AppCompatActivity {
                         //   Events        : up to  30s (typically 10-20s)
                         //   Total         : guaranteed ≤ 420s regardless of meter behaviour
                         long sessionStartMs = System.currentTimeMillis();
-                        sessionDeadlineMs   = sessionStartMs + (SESSION_MAX_SECONDS * 1000L);
+                        // V46: scale session cap with LP day count for long Genus reads.
+                        // Genus serves ~7 records/response ≈ 12s/day; 09-07 log showed LP
+                        // cut at day 28/36 by the 540s cap.
+                        int sessionMaxSecs = SESSION_MAX_SECONDS;
+                        if (lsDays > 15)
+                            sessionMaxSecs = Math.min(900, SESSION_MAX_SECONDS + (lsDays - 15) * 12);
+                        sessionDeadlineMs   = sessionStartMs + (sessionMaxSecs * 1000L);
                         // Reset phase flags — will be set if any phase is skipped or cut short
                         phaseSkipMidnight   = false; phaseSkipLp         = false;
                         phaseSkipBilling    = false; phaseSkipEvents     = false;
                         phasePartialLp      = false; phasePartialBilling = false;
                         phaseBillingReached = false; // V44
-                        appendLog("SESSION_DEADLINE set=" + SESSION_MAX_SECONDS + "s deadline="
+                        appendLog("SESSION_DEADLINE set=" + sessionMaxSecs + "s (lsDays=" + lsDays
+                                + ") deadline="
                                 + new java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
                                 .format(new java.util.Date(sessionDeadlineMs)));
 
@@ -9437,8 +9445,14 @@ public class Reading extends AppCompatActivity {
         while (true) {
             int found = lowerHex.indexOf("090c07e", idx);
             if (found < 0) break;
-            java.util.Date t = decodeLpTs(lowerHex, found);
-            if (t != null) out.add(t.getTime());
+            // V46 STRICT: a stamp only counts when preceded by an intact struct head
+            // '02 <fieldcount>' — exactly what mergeLpPageHexList keeps.
+            if (found >= 4
+                    && lowerHex.charAt(found - 4) == '0'
+                    && lowerHex.charAt(found - 3) == '2') {
+                java.util.Date t = decodeLpTs(lowerHex, found);
+                if (t != null) out.add(t.getTime());
+            }
             idx = found + 1;
         }
     }
@@ -9546,9 +9560,12 @@ public class Reading extends AppCompatActivity {
                     && !deadSlots.contains(gapEnd + periodMs))
                 gapEnd += periodMs;
 
-            // V45: 3-attempt escalation ladder per gap slot
             int prevAttempts = gapAttempts.getOrDefault(gapStart, 0);
-            if (prevAttempts >= 3) {
+            // V46: tail gaps (no received records after gapStart in this day) get max 2
+            // attempts; interior gaps get 3 — cuts Genus truncated-day timeout waste.
+            boolean tailGap = daySlots.isEmpty() || gapStart > daySlots.last();
+            int maxAttempts = tailGap ? 2 : 3;
+            if (prevAttempts >= maxAttempts) {
                 // Exhausted all 3 attempts — mark range dead.
                 // Cross-day learning only for confirmed meter responses, not HDLC timeouts.
                 boolean confirmed = !gapSawTimeout.contains(gapStart);
@@ -9596,7 +9613,15 @@ public class Reading extends AppCompatActivity {
                 selEndTimeOverride = null;
             }
             pages++;
-            if (!lastSelHadResponse) gapSawTimeout.add(gapStart); // V45: track HDLC timeouts
+            if (!lastSelHadResponse) {
+                gapSawTimeout.add(gapStart);
+                // V46: a no-response gap request can leave a pending segmented reply
+                // jamming the meter. Clear both sides before the next request.
+                try {
+                    abortPendingBlockTransfer(port);
+                    drainPort(port);
+                } catch (Exception ignored) {}
+            }
 
             String pageHex = (resp == null) ? "" : resp.toString().trim();
             boolean accepted = false;
@@ -10686,7 +10711,8 @@ public class Reading extends AppCompatActivity {
                     idx += 4;
                 }
                 if (recStart >= 0 && recStart < page.length()) {
-                    int recCnt = countLoadProfileRecords(page);
+                    int strictCnt = countIntactLpRecords(page);
+                    int recCnt = (strictCnt > 0) ? strictCnt : countLoadProfileRecords(page);
                     appendLog("LP_MERGE_ROW_FALLBACK prefix=" + lower.substring(0, Math.min(16, lower.length()))
                             + " recStart=" + recStart + " cnt=" + recCnt);
                     totalCount += recCnt;
@@ -10699,9 +10725,10 @@ public class Reading extends AppCompatActivity {
             } else if (dataStart + 2 <= lower.length()
                     && lower.charAt(dataStart) == '0' && lower.charAt(dataStart + 1) == '2') {
                 // dataStart points to a DLMS structure tag (02) — valid records follow.
-                // V45: use actual records present, not declared header count (Secure delivers
-                // declared-1 per block boundary → declared overstates by 1/day/page).
-                int actualRecs = countLoadProfileRecords(page);
+                // V46: use strict intact-record count to match exactly what merge keeps;
+                // falls back to header count only if no intact records detected.
+                int strictRecs = countIntactLpRecords(page);
+                int actualRecs = (strictRecs > 0) ? strictRecs : countLoadProfileRecords(page);
                 totalCount += (actualRecs > 0) ? actualRecs : cnt;
                 allRecords.append(page.substring(dataStart));
             } else {
@@ -10719,7 +10746,8 @@ public class Reading extends AppCompatActivity {
                     idx += 4;
                 }
                 if (recStart >= 0 && recStart < page.length()) {
-                    int recCnt = countLoadProfileRecords(page);
+                    int strictCnt = countIntactLpRecords(page);
+                    int recCnt = (strictCnt > 0) ? strictCnt : countLoadProfileRecords(page);
                     appendLog("LP_MERGE_HDR_FALLBACK prefix=" + lower.substring(0, Math.min(16, lower.length()))
                             + " recStart=" + recStart + " cnt=" + recCnt);
                     totalCount += recCnt;
@@ -10753,11 +10781,22 @@ public class Reading extends AppCompatActivity {
         // Keep the explicit uppercase marker too in case mixed-case payloads are passed in.
         if (lpHex.contains("0212090C")) return true;
 
+        // V46: a SINGLE intact record ('02 <fieldcount>' + clock) is a valid LP page.
+        // Old rule needed >=2 loose 090c hits, so 1-record refill responses (the exact
+        // gap fill the ladder produces) were discarded as empty.
+        String lowerHex = lpHex.toLowerCase();
+        int sIdx = 0;
+        while ((sIdx = lowerHex.indexOf("090c07e", sIdx)) >= 0) {
+            if (sIdx >= 4
+                    && lowerHex.charAt(sIdx - 4) == '0'
+                    && lowerHex.charAt(sIdx - 3) == '2') return true;
+            sIdx += 1;
+        }
+
         // Some meter makes return LP buffers with a different row prefix while the DLMS
         // clock object still appears as repeating 090c timestamps inside the payload.
         int tsCount = 0;
         int idx = 0;
-        String lowerHex = lpHex.toLowerCase();
         while ((idx = lowerHex.indexOf("090c", idx)) >= 0) {
             tsCount++;
             idx += 4;
@@ -10765,6 +10804,20 @@ public class Reading extends AppCompatActivity {
         }
 
         return false;
+    }
+
+    private int countIntactLpRecords(String lpHex) {
+        if (lpHex == null || lpHex.isEmpty()) return 0;
+        String lowerHex = lpHex.toLowerCase();
+        int count = 0;
+        int idx = 0;
+        while ((idx = lowerHex.indexOf("090c07e", idx)) >= 0) {
+            if (idx >= 4
+                    && lowerHex.charAt(idx - 4) == '0'
+                    && lowerHex.charAt(idx - 3) == '2') count++;
+            idx += 1;
+        }
+        return count;
     }
 
     private int countLoadProfileRecords(String lpHex) {
@@ -11438,6 +11491,38 @@ public class Reading extends AppCompatActivity {
                             // we've passed the filled portion of the buffer. Guard last 3 days
                             // so today's partial-day data is never skipped across a gap.
                             if (consecutiveEmptyDays >= 2 && i > 3) {
+                                // V46: consecutive empty-array days can be a jammed link from
+                                // a previous NO-RESPONSE gap request — try one reconnect first.
+                                if (!stalledReconnectDone && !abortRequested) {
+                                    stalledReconnectDone = true;
+                                    appendLog("RLS_EMPTY_STALL_RECONNECT day=-" + i
+                                            + " — empty arrays may be a stuck transfer, reconnecting");
+                                    try {
+                                        abortPendingBlockTransfer(port);
+                                        drainPort(port);
+                                        AddressInit();
+                                        boolean nrmOk = SetNRM(port, this.bytWait, (byte) 2, this.bytTimOut);
+                                        appendLog("RLS_EMPTY_STALL_NRM=" + nrmOk);
+                                        if (nrmOk) {
+                                            int aarqRes = AARQ(port, (byte) 1, currentMeterMake.getPassword(),
+                                                    this.bytWait, (byte) 3, this.bytTimOut);
+                                            appendLog("RLS_EMPTY_STALL_AARQ=" + aarqRes);
+                                            if (aarqRes == 0) {
+                                                drainPort(port);
+                                                appendLog("RLS_EMPTY_STALL_OK — retrying day=-" + i);
+                                                consecutiveEmptyDays = 0;
+                                                i--; // redo this day on the fresh session
+                                                continue;
+                                            } else {
+                                                appendLog("RLS_EMPTY_STALL_AARQ_FAIL — stopping LP");
+                                            }
+                                        } else {
+                                            appendLog("RLS_EMPTY_STALL_NRM_FAIL — stopping LP");
+                                        }
+                                    } catch (Exception rex) {
+                                        appendLog("RLS_EMPTY_STALL_EX: " + rex.getMessage());
+                                    }
+                                }
                                 appendLog("RLS_SEL_EARLY_STOP_EMPTY day=-" + i
                                         + " consecutiveEmpty=" + consecutiveEmptyDays);
                                 break;
