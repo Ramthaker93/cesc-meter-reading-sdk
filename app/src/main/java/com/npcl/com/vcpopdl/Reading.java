@@ -1,3 +1,4 @@
+// VERSION: V45 — (1) lastSelHadResponse flag: only confirmed-empty-array responses count for cross-day dead-slot learning — HDLC timeouts never poison gap tracking. (2) 3-attempt escalation ladder per gap: exact range (atpt1) → widened ±1 interval (atpt2) → shifted window 8 intervals earlier to day-end (atpt3) repositions missing slot away from block boundary (Secure drops last record at each block boundary; Genus bulk truncates at first block). (3) Cross-day dead-slot learning gated on confirmed meter response, not timeout. (4) Widened-request response containing ONLY already-seen timestamps escalates without appending duplicate page. (5) LP_PAGE_AUDIT on every accepted page: declared vs actual record count + timestamp range + ***LOST=n*** marker. (6) mergeLpPageHexList header count = actual records present not sum of declared counts. (7) MAX_GAP_PAGES 16→24 for Genus multi-block day recovery (2026-07-09)
 // VERSION: V44 — (1) PHASE ORDER: NamePlate -> Instantaneous -> Billing -> Midnight -> Events -> Load Profile (LP moved LAST for all modes where applicable). LP is the longest, most failure-prone phase (Secure firmware stalls kill the HDLC link); billing/midnight/events are now secured while the link is healthy, and LP gets ALL remaining session time (90s billing+events reserve removed, lpDeadlineMs = sessionDeadlineMs). REASSOC_POST_BILLING resets COSEM after billing block transfers BEFORE the profile-generic reads (midnight/LP) - watch Genus results since LC001 firmware buffer state survives REASSOC (V35). (2) SAVE-TILL-BILLING: in Complete/Billing+Event mode the TXT is now SAVED whenever phases through Billing completed (phaseBillingReached), even if midnight/events/LP failed or the user aborted mid-LP (MakeDataFile ABORT_OVERRIDE) - 08-07 four aborted sessions each discarded 2262 good LP records (2026-07-08)
 // VERSION: V43 — HDLC CONTINUATION-FRAME 3-BYTE FIX: Only the FIRST frame of a segmented APDU carries LLC header E6 E7 00; HDLC continuation frames start with raw APDU bytes at bytAddMode+8. Previously all three continuation-frame receive paths unconditionally skipped 3 bytes (LLC header), losing 3 real data bytes per frame boundary → ~10 corrupted LP records/day (proven SS09084148 08-07-2026: 319 malformed records/day, each missing exactly 3 consecutive bytes). Fix: rcvHasLlc() detects LLC presence, llcDataStart() returns correct data start; C4 02 DataBlock guard also protected with rcvHasLlc() check to prevent false positive on raw continuation bytes (2026-07-08)
 // VERSION: V42 — (1) GAP-DRIVEN LP COMPLETION: Secure firmware truncates LP1 attr=2 responses per day (KT152227: midnight + newest 22/day in bulk AND selective; SS09084148: today cut at first block) — forward-only pagination can never fetch the missing middle-of-day records; new lpFillDayGaps() builds a per-day coverage set of received interval timestamps, finds missing slot ranges, and requests exactly those ranges via selective access with an exact end-time override (selEndTimeOverride), marking ranges the meter truly has no data for (outages) as dead to avoid re-requesting; runs after bulk (per-day completeness check seeded from bulk coverage, replaces the old declared>cnt partial-bulk supplement) and inside the selective day loop (replaces forward-only extractLastLpTimestamp pagination). (2) DUPLICATE_SKIPPED-today fix: probe payload made day-0 response a duplicate → continue skipped pagination entirely, leaving today at one page (SS09084148 06-07: 10 records 00:00-02:15 despite meter powered to 18:06) — duplicates now still run gap completion. (3) New reading mode BILLING_EVENT "Billing+Event": identical to Complete minus interval load profile (D4); midnight/daily, billing, events, instantaneous all retained (2026-07-07)
@@ -219,6 +220,11 @@ public class Reading extends AppCompatActivity {
     // back empty. At 2+ the slot is pre-marked dead on later days (cross-day learning
     // for makes that never store certain slots). Reset at each ReadLoadSurveyData.
     private final java.util.HashMap<Integer, Integer> lpGapEmptyMinuteCount = new java.util.HashMap<>();
+    // V45: true when the last GetParameterSelective received at least one valid response
+    // frame from the meter (even an empty/no-data one); false on HDLC timeout with no
+    // response. Lets lpFillDayGaps distinguish "confirmed empty" (safe to learn from)
+    // from "link failure" (must NOT poison cross-day gap learning).
+    private volatile boolean lastSelHadResponse = false;
     // Session deadline — set at start of COMPLETE mode, hard cap of 9 minutes total.
     // Checked before each phase. When exceeded, remaining phases are skipped and
     // whatever data was collected is written to file as a partial/complete result.
@@ -6389,6 +6395,7 @@ public class Reading extends AppCompatActivity {
         while (!flag2 && (int) num184 != (int) nTryCount);
 
         // appendLog("Loop Outer Cunter" +flag2);
+        this.lastSelHadResponse = flag2; // V45: callers distinguish confirmed-empty from timeout
 
         if (!flag2)
             SbData.append("");
@@ -9454,6 +9461,50 @@ public class Reading extends AppCompatActivity {
      *
      * @return number of new records retrieved for this day
      */
+
+    /** V45: Parse the DLMS array declared-count from the LP page header (BER-encoded). */
+    private int lpDeclaredCount(String pageHex) {
+        try {
+            if (pageHex == null || pageHex.length() < 4) return -1;
+            String lower = pageHex.toLowerCase();
+            for (int skip = 0; skip <= 32; skip += 2) {
+                if (skip + 4 > lower.length()) break;
+                int tagByte = Integer.parseInt(lower.substring(skip, skip + 2), 16);
+                if (tagByte != 0x01) continue;
+                int countByte = Integer.parseInt(lower.substring(skip + 2, skip + 4), 16);
+                if ((countByte & 0x80) == 0) return countByte;
+                int nb = countByte & 0x7F;
+                if (nb == 1 && skip + 6 <= lower.length())
+                    return Integer.parseInt(lower.substring(skip + 4, skip + 6), 16);
+                if (nb == 2 && skip + 8 <= lower.length())
+                    return Integer.parseInt(lower.substring(skip + 4, skip + 8), 16);
+                return -1;
+            }
+        } catch (Exception ignored) {}
+        return -1;
+    }
+
+    /** V45: Log declared vs actual record count + timestamp range for an LP page. */
+    private void lpAuditPage(String tag, String pageHex) {
+        try {
+            if (pageHex == null || pageHex.length() < 8) {
+                appendLog("LP_PAGE_AUDIT " + tag + " EMPTY_PAGE");
+                return;
+            }
+            int declared = lpDeclaredCount(pageHex);
+            int actual   = countLoadProfileRecords(pageHex);
+            java.util.TreeSet<Long> ts = new java.util.TreeSet<>();
+            collectLpTimestamps(pageHex, ts);
+            String range = ts.isEmpty() ? "none"
+                    : (new java.util.Date(ts.first()) + " .. " + new java.util.Date(ts.last()));
+            appendLog("LP_PAGE_AUDIT " + tag + " declared=" + declared + " actual=" + actual
+                    + " uniqueTs=" + ts.size() + " range=" + range
+                    + ((declared > 0 && declared > actual) ? " ***LOST=" + (declared - actual) + "***" : ""));
+        } catch (Exception e) {
+            appendLog("LP_PAGE_AUDIT_EX " + tag + ": " + e.getMessage());
+        }
+    }
+
     private int lpFillDayGaps(UsbSerialPort port, java.util.Date dayStart, int capturePeriodMin,
                               java.util.TreeSet<Long> daySlots,
                               java.util.List<String> lpPageHexList,
@@ -9461,95 +9512,132 @@ public class Reading extends AppCompatActivity {
         final long periodMs   = capturePeriodMin * 60_000L;
         final long dayStartMs = dayStart.getTime();
         final long nextDayMs  = dayStartMs + 24L * 3600_000L;
-        long dayEndMs = nextDayMs - periodMs; // last slot of the day (e.g. 23:45)
+        long dayEndMs = nextDayMs - periodMs;
         long now = System.currentTimeMillis();
         if (now < nextDayMs) {
-            // Today: cap at the last fully completed interval
             long lastComplete = dayStartMs + (((now - dayStartMs) / periodMs) - 1) * periodMs;
-            if (lastComplete < dayStartMs) return 0; // day just started, nothing expected yet
+            if (lastComplete < dayStartMs) return 0;
             dayEndMs = Math.min(dayEndMs, lastComplete);
         }
         java.util.HashSet<Long> deadSlots = new java.util.HashSet<>();
-        // Cross-day learning: a time-of-day range confirmed empty on 2+ previous days
-        // (make never stores that slot, e.g. no 00:00 record convention) is pre-marked
-        // dead so later days don't pay a request for it.
         for (long t = dayStartMs; t <= dayEndMs; t += periodMs) {
             Integer ec = lpGapEmptyMinuteCount.get((int) ((t - dayStartMs) / 60_000L));
             if (ec != null && ec >= 2) deadSlots.add(t);
         }
         int added = 0;
         int pages = 0;
-        final int MAX_GAP_PAGES = 16;
+        final int MAX_GAP_PAGES = 24; // V45: 16→24 for Genus multi-block day recovery
+        // V45: per-gap attempt counter; gapSawTimeout tracks gaps where meter never responded
+        java.util.HashMap<Long, Integer> gapAttempts = new java.util.HashMap<>();
+        java.util.HashSet<Long> gapSawTimeout = new java.util.HashSet<>();
         while (pages < MAX_GAP_PAGES) {
             if (abortRequested || lpShouldAbort()) {
                 appendLog("RLS_GAP_DEADLINE day=-" + dayIndex + " pages=" + pages);
                 break;
             }
-            // Find first missing slot, extend to the end of the missing run
             long gapStart = -1;
             for (long t = dayStartMs; t <= dayEndMs; t += periodMs) {
                 if (!daySlots.contains(t) && !deadSlots.contains(t)) { gapStart = t; break; }
             }
-            if (gapStart < 0) break; // day complete (or all remaining gaps confirmed unavailable)
+            if (gapStart < 0) break;
             long gapEnd = gapStart;
             while (gapEnd + periodMs <= dayEndMs
                     && !daySlots.contains(gapEnd + periodMs)
                     && !deadSlots.contains(gapEnd + periodMs))
                 gapEnd += periodMs;
 
-            appendLog("RLS_GAP_REQ day=-" + dayIndex + " page=" + (pages + 1)
-                    + " from=" + new java.util.Date(gapStart) + " to=" + new java.util.Date(gapEnd));
+            // V45: 3-attempt escalation ladder per gap slot
+            int prevAttempts = gapAttempts.getOrDefault(gapStart, 0);
+            if (prevAttempts >= 3) {
+                // Exhausted all 3 attempts — mark range dead.
+                // Cross-day learning only for confirmed meter responses, not HDLC timeouts.
+                boolean confirmed = !gapSawTimeout.contains(gapStart);
+                for (long t = gapStart; t <= gapEnd; t += periodMs) {
+                    deadSlots.add(t);
+                    if (confirmed) {
+                        int mod = (int) ((t - dayStartMs) / 60_000L);
+                        Integer ec = lpGapEmptyMinuteCount.get(mod);
+                        lpGapEmptyMinuteCount.put(mod, ec == null ? 1 : ec + 1);
+                    }
+                }
+                appendLog("RLS_GAP_EXHAUSTED day=-" + dayIndex
+                        + " gapStart=" + new java.util.Date(gapStart)
+                        + " confirmed=" + confirmed + " — marked dead");
+                continue;
+            }
+            int attempt = prevAttempts + 1;
+            gapAttempts.put(gapStart, attempt);
+
+            // Build request window: each attempt repositions/widens the range
+            long reqStart, reqEnd;
+            if (attempt == 1) {
+                reqStart = gapStart;
+                reqEnd   = gapEnd + periodMs;
+            } else if (attempt == 2) {
+                // Widen by ±1 interval
+                reqStart = Math.max(dayStartMs, gapStart - periodMs);
+                reqEnd   = Math.min(nextDayMs,  gapEnd + 2 * periodMs);
+            } else {
+                // Shift window 8 intervals earlier to day-end — moves missing slot away
+                // from APDU block boundary where Secure firmware drops the last record
+                reqStart = Math.max(dayStartMs, gapStart - 8 * periodMs);
+                reqEnd   = nextDayMs;
+            }
+
+            appendLog("RLS_GAP_REQ day=-" + dayIndex + " page=" + (pages + 1) + " attempt=" + attempt
+                    + " from=" + new java.util.Date(reqStart) + " to=" + new java.util.Date(reqEnd));
             StringBuilder resp;
             try {
-                // End bound = one interval past the last missing slot (inclusive range)
-                selEndTimeOverride = new java.util.Date(gapEnd + periodMs);
+                selEndTimeOverride = new java.util.Date(reqEnd);
                 resp = GetParameterSelective(port, (byte) 7, "0100630100FF", (byte) 2,
                         this.bytWait, this.bytTryCnt, this.bytTimOut, false,
-                        new java.util.Date(gapStart), new java.util.Date(gapStart), capturePeriodMin);
+                        new java.util.Date(reqStart), new java.util.Date(reqStart), capturePeriodMin);
             } finally {
                 selEndTimeOverride = null;
             }
             pages++;
+            if (!lastSelHadResponse) gapSawTimeout.add(gapStart); // V45: track HDLC timeouts
 
             String pageHex = (resp == null) ? "" : resp.toString().trim();
-            int newCnt = 0;
             boolean accepted = false;
-            if (!pageHex.isEmpty() && hasLoadProfileRecords(pageHex) && !seenPayloads.contains(pageHex)) {
+            boolean knownOnly = false;
+            if (!pageHex.isEmpty() && hasLoadProfileRecords(pageHex)) {
                 java.util.TreeSet<Long> pageSlots = new java.util.TreeSet<>();
                 collectLpTimestamps(pageHex, pageSlots);
+                int newCnt = 0;
                 for (Long t : pageSlots) if (!daySlots.contains(t)) newCnt++;
                 if (newCnt > 0) {
-                    seenPayloads.add(pageHex);
-                    lpPageHexList.add(pageHex);
+                    if (!seenPayloads.contains(pageHex)) {
+                        seenPayloads.add(pageHex);
+                        lpPageHexList.add(pageHex);
+                        lpAuditPage("GAP day=-" + dayIndex + " attempt=" + attempt, pageHex);
+                    }
                     daySlots.addAll(pageSlots);
                     added += newCnt;
                     accepted = true;
-                    appendLog("RLS_GAP_DONE day=-" + dayIndex + " page=" + pages
+                    appendLog("RLS_GAP_DONE day=-" + dayIndex + " page=" + pages + " attempt=" + attempt
                             + " new=" + newCnt + " dayTotal=" + daySlots.size());
-                } else if (countLoadProfileRecords(pageHex) > 0) {
-                    // Records present but no new explicit timestamps: makes like HPL
-                    // return rows without a full clock field. Keep once but mark dead.
+                } else if (countLoadProfileRecords(pageHex) > 0 && !seenPayloads.contains(pageHex)) {
+                    // Records present but no new explicit timestamps (HPL rows without clock field)
                     seenPayloads.add(pageHex);
                     lpPageHexList.add(pageHex);
+                    lpAuditPage("GAP day=-" + dayIndex + " attempt=" + attempt, pageHex);
                     added += countLoadProfileRecords(pageHex);
                     accepted = true;
-                    appendLog("RLS_GAP_IMPLICIT day=-" + dayIndex + " page=" + pages
+                    appendLog("RLS_GAP_IMPLICIT day=-" + dayIndex + " page=" + pages + " attempt=" + attempt
                             + " records=" + countLoadProfileRecords(pageHex)
                             + " (rows without clock field) — range closed");
                     for (long t = gapStart; t <= gapEnd; t += periodMs) deadSlots.add(t);
+                } else if (!pageSlots.isEmpty()) {
+                    // V45: response has records but all are already in daySlots — escalate
+                    knownOnly = true;
+                    appendLog("RLS_GAP_KNOWN_ONLY day=-" + dayIndex + " page=" + pages + " attempt=" + attempt
+                            + " — all timestamps already seen, escalating");
                 }
             }
             if (!accepted) {
-                // Meter has no data for this range (outage / condensed storage) — never
-                // re-request, and remember the time-of-day for cross-day learning.
-                for (long t = gapStart; t <= gapEnd; t += periodMs) {
-                    deadSlots.add(t);
-                    int mod = (int) ((t - dayStartMs) / 60_000L);
-                    Integer ec = lpGapEmptyMinuteCount.get(mod);
-                    lpGapEmptyMinuteCount.put(mod, ec == null ? 1 : ec + 1);
-                }
-                appendLog("RLS_GAP_EMPTY day=-" + dayIndex + " page=" + pages
-                        + " — range marked unavailable");
+                appendLog("RLS_GAP_EMPTY day=-" + dayIndex + " page=" + pages + " attempt=" + attempt
+                        + (knownOnly ? " (known-only, escalating)" : " — no new data"));
             }
         }
         return added;
@@ -10611,7 +10699,10 @@ public class Reading extends AppCompatActivity {
             } else if (dataStart + 2 <= lower.length()
                     && lower.charAt(dataStart) == '0' && lower.charAt(dataStart + 1) == '2') {
                 // dataStart points to a DLMS structure tag (02) — valid records follow.
-                totalCount += cnt;
+                // V45: use actual records present, not declared header count (Secure delivers
+                // declared-1 per block boundary → declared overstates by 1/day/page).
+                int actualRecs = countLoadProfileRecords(page);
+                totalCount += (actualRecs > 0) ? actualRecs : cnt;
                 allRecords.append(page.substring(dataStart));
             } else {
                 // False array-tag hit in DLMS response header (e.g. invoke-id byte == 0x01).
@@ -11078,6 +11169,7 @@ public class Reading extends AppCompatActivity {
                         + " timestamps=" + cnt);
             }
             appendLog("RLS_BULK_OK len=" + lpHex.length() + " declared=" + lpEntriesDeclared[0] + " actualRecords=" + cnt);
+            lpAuditPage("BULK", lpHex); // V45
 
             // V42: per-day completeness check + gap supplement (replaces the old
             // declared>cnt partial-bulk supplement, which re-requested whole days and
@@ -11240,6 +11332,7 @@ public class Reading extends AppCompatActivity {
                                     totalActualRecords += bulkCnt;
                                     lpPageHexList.add(bulkHex);
                                     seenPayloads.add(bulkHex);
+                                    lpAuditPage("BULK_FALLBACK", bulkHex); // V45
                                     appendLog("RLS_BULK_FALLBACK_HAS_DATA records=" + bulkCnt
                                             + " — EIU firmware bug confirmed, using bulk LP data (day loop skipped)");
                                     // V42: bulk-fallback payload gets the same per-day gap
@@ -11430,6 +11523,7 @@ public class Reading extends AppCompatActivity {
                         lpPageHexList.add(lpHex);
                         selectiveOk++;
                         appendLog("RLS_SEL_DAY day=-" + i + " len=" + lpHex.length() + " records=" + cnt);
+                        lpAuditPage("DAY day=-" + i, lpHex); // V45
 
                         // ── V42 GAP-DRIVEN COMPLETION (replaces forward-only pagination) ──
                         // Meters truncate a day-request to one APDU/block. Forward
