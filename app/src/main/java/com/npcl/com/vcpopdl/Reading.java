@@ -1,3 +1,5 @@
+// VERSION: V47b — ENTRY-ACCESS FALLBACK: LP1 GetParameterSelective supports access selector 2 (read-by-entry-number) via selEntryFrom/selEntryTo fields and new lpGetByEntry() wrapper. After the day loop, when coverage ends >1 day short of the lsDays window, LP_ENTRY_FALLBACK sweeps the remainder by entry number newest→oldest in recPerDay chunks. Bypasses the meter's time-range engine (which the 09-07 logs show dying ~8 days back on Secure). Bounded 60 pages, 2 consecutive empty stops, ensureSessionAlive first, failures harmless (2026-07-09)
+// VERSION: V47 — STALE-RESPONSE DESYNC GUARD: in lpFillDayGaps, when a response's every timestamp predates the requested window (stale late-retransmission from prior timeout), abort+drain and retry the same gap WITHOUT consuming a ladder attempt (max 4 desync recoveries/day). SESSION_END/OVERRUN now compares against the scaled sessionMaxSecs instead of the base SESSION_MAX_SECONDS constant — fixes false overrun log on 09-07 15:29 where 670s>540s was printed while real cap was 780s (2026-07-09)
 // VERSION: V46 — (1) collectLpTimestamps STRICT: clock only counts when preceded by intact struct head '02 <fieldcount>' — mangled-head records (single-frame offset bug) no longer falsely mark gap slots covered, so 3-attempt ladder fires and recovers the dropped record. (2) hasLoadProfileRecords accepts SINGLE intact record: old >=2 loose 090c rule discarded 1-record refill responses from gap ladder. (3) countIntactLpRecords new method: strict '02'-prefixed clock count used in mergeLpPageHexList to stop header totals from overstating. (4) Tail gaps get max 2 attempts vs 3 for interior gaps — cuts Genus truncated-day timeout waste. (5) NO-RESPONSE gap request: abortPendingBlockTransfer+drainPort before next attempt — pending transfer was poisoning subsequent days into empty arrays and early-stop. (6) EMPTY_SKIPPED consecutive days now attempt one-shot stall reconnect before RLS_SEL_EARLY_STOP_EMPTY (reconnect existed only in NO_DATA branch). (7) Session scaling: sessionMaxSecs = min(900, BASE + (lsDays-15)*12) for lsDays>15 — Genus 36-day reads were cut at day 28/36 by 540s cap (2026-07-09)
 // VERSION: V45 — (1) lastSelHadResponse flag: only confirmed-empty-array responses count for cross-day dead-slot learning — HDLC timeouts never poison gap tracking. (2) 3-attempt escalation ladder per gap: exact range (atpt1) → widened ±1 interval (atpt2) → shifted window 8 intervals earlier to day-end (atpt3) repositions missing slot away from block boundary (Secure drops last record at each block boundary; Genus bulk truncates at first block). (3) Cross-day dead-slot learning gated on confirmed meter response, not timeout. (4) Widened-request response containing ONLY already-seen timestamps escalates without appending duplicate page. (5) LP_PAGE_AUDIT on every accepted page: declared vs actual record count + timestamp range + ***LOST=n*** marker. (6) mergeLpPageHexList header count = actual records present not sum of declared counts. (7) MAX_GAP_PAGES 16→24 for Genus multi-block day recovery (2026-07-09)
 // VERSION: V44 — (1) PHASE ORDER: NamePlate -> Instantaneous -> Billing -> Midnight -> Events -> Load Profile (LP moved LAST for all modes where applicable). LP is the longest, most failure-prone phase (Secure firmware stalls kill the HDLC link); billing/midnight/events are now secured while the link is healthy, and LP gets ALL remaining session time (90s billing+events reserve removed, lpDeadlineMs = sessionDeadlineMs). REASSOC_POST_BILLING resets COSEM after billing block transfers BEFORE the profile-generic reads (midnight/LP) - watch Genus results since LC001 firmware buffer state survives REASSOC (V35). (2) SAVE-TILL-BILLING: in Complete/Billing+Event mode the TXT is now SAVED whenever phases through Billing completed (phaseBillingReached), even if midnight/events/LP failed or the user aborted mid-LP (MakeDataFile ABORT_OVERRIDE) - 08-07 four aborted sessions each discarded 2262 good LP records (2026-07-08)
@@ -226,6 +228,13 @@ public class Reading extends AppCompatActivity {
     // response. Lets lpFillDayGaps distinguish "confirmed empty" (safe to learn from)
     // from "link failure" (must NOT poison cross-day gap learning).
     private volatile boolean lastSelHadResponse = false;
+    // V47: when selEntryFrom > 0, GetParameterSelective sends access-selector 2
+    // (read-by-ENTRY-NUMBER) instead of selector 1 (time range). Entry access does
+    // not involve the meter's time-range engine — which the 09-07 logs show dying
+    // ~8 days back on Secure (requests slow -> empty -> AARQ dead) while the MRI
+    // reader retrieves the same records. Set via lpGetByEntry() only.
+    private volatile long selEntryFrom = 0;
+    private volatile long selEntryTo   = 0;
     // Session deadline — set at start of COMPLETE mode, hard cap of 9 minutes total.
     // Checked before each phase. When exceeded, remaining phases are skipped and
     // whatever data was collected is written to file as a partial/complete result.
@@ -1589,10 +1598,13 @@ public class Reading extends AppCompatActivity {
                         // ── Session summary ──────────────────────────────────────────────
                         stopPhaseTimer();
                         long sessionElapsed = System.currentTimeMillis() - sessionStartMs;
-                        boolean sessionOverrun = sessionElapsed > (SESSION_MAX_SECONDS * 1000L);
-                        appendLog("SESSION_END elapsed=" + (sessionElapsed/1000) + "s limit=" + SESSION_MAX_SECONDS + "s overrun=" + sessionOverrun);
+                        // V47: compare against the scaled cap (sessionMaxSecs), not the base
+                        // constant — the 09-07 15:29 log printed a false overrun (670s > 540s
+                        // while the actual cap was 780s).
+                        boolean sessionOverrun = sessionElapsed > (sessionMaxSecs * 1000L);
+                        appendLog("SESSION_END elapsed=" + (sessionElapsed/1000) + "s limit=" + sessionMaxSecs + "s overrun=" + sessionOverrun);
                         if (sessionOverrun)
-                            appendLog("SESSION_OVERRUN: elapsed=" + (sessionElapsed/1000) + "s exceeded " + SESSION_MAX_SECONDS + "s limit");
+                            appendLog("SESSION_OVERRUN: elapsed=" + (sessionElapsed/1000) + "s exceeded " + sessionMaxSecs + "s limit");
                         sessionDeadlineMs = 0; // reset for next session
 
                         // Restore originals
@@ -5931,6 +5943,34 @@ public class Reading extends AppCompatActivity {
         byte num34 = (byte) (index12 + num33);
         int num35 = 1;
         numArray11[index12] = (byte) num35;
+        // ── V47 ENTRY MODE (access selector 2) ─────────────────────────────────────
+        if (selEntryFrom > 0) {
+            this.nPkt[index12] = (byte) 2; // overwrite selector: 2 = by entry
+            int wp = (int) num34;
+            this.nPkt[wp++] = (byte) 0x02; // structure
+            this.nPkt[wp++] = (byte) 0x04; // of 4 elements
+            this.nPkt[wp++] = (byte) 0x06; // from_entry : double-long-unsigned
+            this.nPkt[wp++] = (byte) ((selEntryFrom >> 24) & 0xFF);
+            this.nPkt[wp++] = (byte) ((selEntryFrom >> 16) & 0xFF);
+            this.nPkt[wp++] = (byte) ((selEntryFrom >>  8) & 0xFF);
+            this.nPkt[wp++] = (byte) ( selEntryFrom        & 0xFF);
+            this.nPkt[wp++] = (byte) 0x06; // to_entry
+            this.nPkt[wp++] = (byte) ((selEntryTo >> 24) & 0xFF);
+            this.nPkt[wp++] = (byte) ((selEntryTo >> 16) & 0xFF);
+            this.nPkt[wp++] = (byte) ((selEntryTo >>  8) & 0xFF);
+            this.nPkt[wp++] = (byte) ( selEntryTo        & 0xFF);
+            this.nPkt[wp++] = (byte) 0x12; // from_selected_value = 1 (first captured object)
+            this.nPkt[wp++] = (byte) 0x00;
+            this.nPkt[wp++] = (byte) 0x01;
+            this.nPkt[wp++] = (byte) 0x12; // to_selected_value = 0 (all captured objects)
+            this.nPkt[wp++] = (byte) 0x00;
+            this.nPkt[wp++] = (byte) 0x00;
+            this.nPkt[2] = (byte) wp;
+            this.fcs(this.nPkt, ((0xff & this.bytAddMode) + 5), (byte) 1);
+            this.fcs(this.nPkt, wp - 1, (byte) 1);
+            this.nPkt[wp + 2] = (byte) 126;
+            appendLog("SEL_ENTRY_REQ from=" + selEntryFrom + " to=" + selEntryTo);
+        } else {
         byte[] numArray12 = this.nPkt;
         int index13 = (int) num34;
         int num36 = 1;
@@ -6348,6 +6388,7 @@ public class Reading extends AppCompatActivity {
         this.fcs(this.nPkt, ((0xff & this.bytAddMode) + 5), (byte) 1);
         this.fcs(this.nPkt, (int) (byte)((int) num182 - 1), (byte) 1);
         this.nPkt[(int) num182 + 2] = (byte) 126;
+        } // end else (range mode / access selector 1)
 
         if (isDLM) {
             if (Integer.toHexString(nClassID).length()==1  )
@@ -9417,6 +9458,25 @@ public class Reading extends AppCompatActivity {
         }
     }
 
+    /**
+     * V47: one LP1 attr=2 request by ENTRY NUMBER (access selector 2).
+     * Reuses GetParameterSelective's framing/response handling; the date args are
+     * placeholders (ignored in entry mode). Returns the raw page like any other
+     * selective call. Used by the entry-access fallback sweep only.
+     */
+    private StringBuilder lpGetByEntry(UsbSerialPort port, long fromEntry, long toEntry, int periodMin) {
+        try {
+            selEntryFrom = fromEntry;
+            selEntryTo   = toEntry;
+            return GetParameterSelective(port, (byte) 7, "0100630100FF", (byte) 2,
+                    this.bytWait, this.bytTryCnt, this.bytTimOut, false,
+                    new java.util.Date(), new java.util.Date(), periodMin);
+        } finally {
+            selEntryFrom = 0;
+            selEntryTo   = 0;
+        }
+    }
+
     // Decode a DLMS datetime at hex position pos (skips the 4-char "090c" tag+length prefix).
     private java.util.Date decodeLpTs(String lowerHex, int pos) {
         try {
@@ -9543,6 +9603,7 @@ public class Reading extends AppCompatActivity {
         final int MAX_GAP_PAGES = 24; // V45: 16→24 for Genus multi-block day recovery
         // V45: per-gap attempt counter; gapSawTimeout tracks gaps where meter never responded
         java.util.HashMap<Long, Integer> gapAttempts = new java.util.HashMap<>();
+        int desyncRetries = 0; // V47: max 4 stale-response drain+retry recoveries per day
         java.util.HashSet<Long> gapSawTimeout = new java.util.HashSet<>();
         while (pages < MAX_GAP_PAGES) {
             if (abortRequested || lpShouldAbort()) {
@@ -9629,6 +9690,23 @@ public class Reading extends AppCompatActivity {
             if (!pageHex.isEmpty() && hasLoadProfileRecords(pageHex)) {
                 java.util.TreeSet<Long> pageSlots = new java.util.TreeSet<>();
                 collectLpTimestamps(pageHex, pageSlots);
+                // V47 DESYNC GUARD: every stamp predates the requested window →
+                // stale late-retransmission from a prior timeout. Abort+drain and
+                // retry the same gap without consuming a ladder attempt.
+                if (!pageSlots.isEmpty() && pageSlots.last() < reqStart && desyncRetries < 4) {
+                    desyncRetries++;
+                    gapAttempts.put(gapStart, attempt - 1); // undo the attempt increment
+                    appendLog("RLS_GAP_DESYNC day=-" + dayIndex + " page=" + pages
+                            + " stale=" + new java.util.Date(pageSlots.first())
+                            + ".." + new java.util.Date(pageSlots.last())
+                            + " reqFrom=" + new java.util.Date(reqStart)
+                            + " retry=" + desyncRetries + " — purging link");
+                    try {
+                        abortPendingBlockTransfer(port);
+                        drainPort(port);
+                    } catch (Exception ignored) {}
+                    continue;
+                }
                 int newCnt = 0;
                 for (Long t : pageSlots) if (!daySlots.contains(t)) newCnt++;
                 if (newCnt > 0) {
@@ -11677,6 +11755,75 @@ public class Reading extends AppCompatActivity {
                 appendLog("RLS_SEL_DONE daysWithData=" + selectiveOk + " totalRecords=" + totalActualRecords);
             } // end else (entriesInUse > 0)
         } // end if (!bulkReadOk)
+
+        // ── V47 ENTRY-ACCESS FALLBACK (access selector 2) ─────────────────────────
+        // When the day-loop coverage ends more than 1 day short of the lsDays window,
+        // sweep the uncovered history by entry number (newest→oldest, recPerDay chunks).
+        // Bypasses the meter's time-range engine which dies ~8 days back on Secure.
+        if (!abortRequested && !lpShouldAbort()) {
+            try {
+                java.util.TreeSet<Long> allGot = new java.util.TreeSet<>();
+                for (String pg : lpPageHexList) collectLpTimestamps(pg, allGot);
+                long wantOldestMs = System.currentTimeMillis() - (long) lsDays * 86400000L;
+                long oldestGotMs = allGot.isEmpty() ? Long.MAX_VALUE : allGot.first();
+                if (oldestGotMs > wantOldestMs + 86400000L) {
+                    long entryHi = (entriesInUse > 0)
+                            ? (long) entriesInUse
+                            : (long) (lsDays + 1) * recPerDay;
+                    appendLog("LP_ENTRY_FALLBACK oldestGot="
+                            + (allGot.isEmpty() ? "none" : String.valueOf(new java.util.Date(oldestGotMs)))
+                            + " target=" + new java.util.Date(wantOldestMs)
+                            + " EIU=" + entriesInUse + " sweepFrom=" + entryHi);
+                    ensureSessionAlive(port, "LP_ENTRY");
+                    final int MAX_ENTRY_PAGES = 60;
+                    int entryPages = 0, entryAdded = 0, entryEmpty = 0;
+                    long hi = entryHi;
+                    while (hi >= 1 && entryPages < MAX_ENTRY_PAGES) {
+                        if (abortRequested || lpShouldAbort()) {
+                            appendLog("LP_ENTRY_DEADLINE pages=" + entryPages);
+                            break;
+                        }
+                        long lo = Math.max(1, hi - recPerDay + 1);
+                        StringBuilder er = lpGetByEntry(port, lo, hi, capturePeriodMin);
+                        entryPages++;
+                        String eh = (er == null) ? "" : er.toString().trim();
+                        java.util.TreeSet<Long> slots = new java.util.TreeSet<>();
+                        if (!eh.isEmpty() && hasLoadProfileRecords(eh)) collectLpTimestamps(eh, slots);
+                        int newCnt = 0;
+                        for (Long t : slots) if (!allGot.contains(t)) newCnt++;
+                        appendLog("LP_ENTRY_PAGE entries=" + lo + ".." + hi
+                                + " records=" + slots.size() + " new=" + newCnt
+                                + (slots.isEmpty() ? "" : (" range=" + new java.util.Date(slots.first())
+                                        + ".." + new java.util.Date(slots.last()))));
+                        if (newCnt > 0 && !seenPayloads.contains(eh)) {
+                            seenPayloads.add(eh);
+                            lpPageHexList.add(eh);
+                            allGot.addAll(slots);
+                            totalActualRecords += newCnt;
+                            entryAdded += newCnt;
+                            entryEmpty = 0;
+                            lpAuditPage("ENTRY " + lo + ".." + hi, eh);
+                        } else {
+                            entryEmpty++;
+                            int emptyLimit = (entryAdded == 0) ? 6 : 2;
+                            if (entryEmpty >= emptyLimit) {
+                                appendLog("LP_ENTRY_STOP consecutive empty/known pages=" + entryEmpty);
+                                break;
+                            }
+                        }
+                        if (!slots.isEmpty() && slots.first() <= wantOldestMs) {
+                            appendLog("LP_ENTRY_TARGET_REACHED first=" + new java.util.Date(slots.first()));
+                            break;
+                        }
+                        hi = lo - 1;
+                    }
+                    appendLog("LP_ENTRY_FALLBACK done pages=" + entryPages + " added=" + entryAdded
+                            + " totalRecords=" + totalActualRecords);
+                }
+            } catch (Exception entryEx) {
+                appendLog("LP_ENTRY_FALLBACK_EX: " + entryEx.getMessage());
+            }
+        }
 
         // ----------------------------------------------------------------
         // STEP 7 – Write attr=7 (entries_in_use) BEFORE all attr=2 lines.
