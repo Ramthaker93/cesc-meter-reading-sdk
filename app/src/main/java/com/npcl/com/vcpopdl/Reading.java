@@ -1,3 +1,4 @@
+// VERSION: V49 — DAY-LOSS DESYNC FIXES (09-07 18:48 V48 Genus read: V48 verified — session ended cleanly at 781s, TXT saved, 2667 records — but stale echoes still lost whole days): (1) DAY-SEL DESYNC GUARD — a stale echo answering the DAY request itself was unguarded (only the gap path had the V47 guard): day -21/Jun-18 received the Jun-19 tail → EMPTY_SKIPPED with 0 records, day -22/Jun-17 received the same frame and closed at 12/97 (DB proves the meter holds 96); response wholly outside [midnight..next-midnight] → purge + redo the day (max 6/read). (2) MANGLED-STALE IMPLICIT-CLOSE GUARD — head-mangled stale echoes have no STRICT clocks so the V47 desync guard never fired; they were accepted as 'rows without clock field' and closed the whole remaining range: every RLS_GAP_IMPLICIT day in the 18:48 log (Jun-17/21/22/25, Jul-01) sits partial in the DB; new collectLpTimestampsLoose() sees the mangled clocks — all predating reqFrom → RLS_GAP_DESYNC_MANGLED retry instead of close (HPL's genuine clockless rows have in-range loose stamps and keep closing normally). (3) ENTRY PROBES run even when attr7=0 (Genus reported 0 tonight vs 487 yesterday — flaky attribute skipped the probes again; top probe uses (lsDays+1)*recPerDay estimate). (4) SESSION CEILING 12→18s/day cap 1200 (measured real Genus pace ~21s/day incl. desync recoveries + ~90s preamble; 780s cut days -34/-35). NOTE: log 'GMT+05:30' labels are Java Date.toString() — GMT+05:30 IS IST, no offset error; but meter KT089348's RTC runs ~24 min behind IST (consistent across 15:29 and 18:48 reads) — needs a field time-sync, not a code change.
 // VERSION: V48 — DEADLINE SPIN-LOOP HANG FIX (09-07 17:03 V47 Genus read: log ends exactly at the 780s deadline mid-request, session then hung SILENTLY ~7 min until user abort; TXT never saved, 23 days of data lost): TWO receive loops in GetParameterSelective break their inner loop on lpShouldAbort() but never release the outer retry loop, which resends the RR and spins forever (log flood unflushed) — (a) FIX-O4 RR loop: num121=nTryCount on abort (SEL_RR_DEADLINE), (b) SEG RR loop: num197=nTryCount + flag1=false (GPLS_SEG_ABORT '— loops released'); same bug class the GPLS_SEL_BLOCK_ABORT comment fixed earlier, missed in these two. MAKE-AGNOSTIC: these loops serve every make (the RR path exists for L&T window=7), so any make crossing the deadline mid-segment would hang identically. ALSO: (c) desync retry now settles 250ms + drains twice (echoed frame can still be in flight at first drain — 17:03 log shows repeat desyncs retry=2/3 on the same gap); (d) EARLY entry-numbering probes right after attr7 (LP_ENTRY_PROBE_TOP/BOTTOM, ~2s, harmless) — collects the per-make entry semantics even when LP dies later, which the 17:03 abort prevented. V47 desync guard verified working (correct detection + recovery each time, RLS_GAP_DONE follows).
 // VERSION: V47b — ENTRY-ACCESS FALLBACK: LP1 GetParameterSelective supports access selector 2 (read-by-entry-number) via selEntryFrom/selEntryTo fields and new lpGetByEntry() wrapper. After the day loop, when coverage ends >1 day short of the lsDays window, LP_ENTRY_FALLBACK sweeps the remainder by entry number newest→oldest in recPerDay chunks. Bypasses the meter's time-range engine (which the 09-07 logs show dying ~8 days back on Secure). Bounded 60 pages, 2 consecutive empty stops, ensureSessionAlive first, failures harmless (2026-07-09)
 // VERSION: V47 — STALE-RESPONSE DESYNC GUARD: in lpFillDayGaps, when a response's every timestamp predates the requested window (stale late-retransmission from prior timeout), abort+drain and retry the same gap WITHOUT consuming a ladder attempt (max 4 desync recoveries/day). SESSION_END/OVERRUN now compares against the scaled sessionMaxSecs instead of the base SESSION_MAX_SECONDS constant — fixes false overrun log on 09-07 15:29 where 670s>540s was printed while real cap was 780s (2026-07-09)
@@ -1375,11 +1376,12 @@ public class Reading extends AppCompatActivity {
                         //   Total         : guaranteed ≤ 420s regardless of meter behaviour
                         long sessionStartMs = System.currentTimeMillis();
                         // V46: scale session cap with LP day count for long Genus reads.
-                        // Genus serves ~7 records/response ≈ 12s/day; 09-07 log showed LP
-                        // cut at day 28/36 by the 540s cap.
+                        // V49: 12→18s/day, cap 900→1200 — the 09-07 18:48 read measured
+                        // ~21s/day real Genus pace (clean 11.5s + desync recoveries) plus
+                        // ~90s preamble; the 780s cap cut days -34/-35.
                         int sessionMaxSecs = SESSION_MAX_SECONDS;
                         if (lsDays > 15)
-                            sessionMaxSecs = Math.min(900, SESSION_MAX_SECONDS + (lsDays - 15) * 12);
+                            sessionMaxSecs = Math.min(1200, SESSION_MAX_SECONDS + (lsDays - 15) * 18);
                         sessionDeadlineMs   = sessionStartMs + (sessionMaxSecs * 1000L);
                         // Reset phase flags — will be set if any phase is skipped or cut short
                         phaseSkipMidnight   = false; phaseSkipLp         = false;
@@ -9530,6 +9532,27 @@ public class Reading extends AppCompatActivity {
     }
 
     /**
+     * V49: LOOSE clock scan — counts every 090c07e clock even when the record
+     * head is mangled (the strict scan above mirrors the merge and skips those).
+     * Used ONLY for stale-response detection: a head-mangled stale echo still
+     * carries real clocks the strict scan can't see, which let desync frames
+     * pass as 'rows without clock field' and close whole ranges (09-07 18:48
+     * log: Jun-17 closed at 12/97 records the DB proves the meter holds).
+     */
+    private void collectLpTimestampsLoose(String lpHex, java.util.TreeSet<Long> out) {
+        if (lpHex == null || lpHex.isEmpty() || out == null) return;
+        String lowerHex = lpHex.toLowerCase();
+        int idx = 0;
+        while (true) {
+            int found = lowerHex.indexOf("090c07e", idx);
+            if (found < 0) break;
+            java.util.Date t = decodeLpTs(lowerHex, found);
+            if (t != null) out.add(t.getTime());
+            idx = found + 1;
+        }
+    }
+
+    /**
      * V42: gap-driven LP day completion.
      * Secure firmware truncates LP1 attr=2 responses per day regardless of read
      * strategy (bulk or selective): KT152227-type returns midnight + the newest 22
@@ -9739,6 +9762,32 @@ public class Reading extends AppCompatActivity {
                     appendLog("RLS_GAP_DONE day=-" + dayIndex + " page=" + pages + " attempt=" + attempt
                             + " new=" + newCnt + " dayTotal=" + daySlots.size());
                 } else if (countLoadProfileRecords(pageHex) > 0 && !seenPayloads.contains(pageHex)) {
+                    // V49: a HEAD-MANGLED stale echo also lands in this branch — the
+                    // strict scan sees no clocks, but a loose scan does, and they all
+                    // predate reqStart. The V47 desync guard above never fired for these
+                    // (it needs strict stamps), so the echo was accepted as 'rows
+                    // without clock field' and the WHOLE remaining range was closed:
+                    // 09-07 18:48 log shows every RLS_GAP_IMPLICIT day (Jun-17/21/22/25,
+                    // Jul-01) left partial in the DB while other reads prove the meter
+                    // holds full 96/day. Detect and retry exactly like a desync.
+                    java.util.TreeSet<Long> looseSlots = new java.util.TreeSet<>();
+                    collectLpTimestampsLoose(pageHex, looseSlots);
+                    if (!looseSlots.isEmpty() && looseSlots.last() < reqStart && desyncRetries < 4) {
+                        desyncRetries++;
+                        gapAttempts.put(gapStart, attempt - 1); // attempt not consumed
+                        appendLog("RLS_GAP_DESYNC_MANGLED day=-" + dayIndex + " page=" + pages
+                                + " stale=" + new java.util.Date(looseSlots.first())
+                                + ".." + new java.util.Date(looseSlots.last())
+                                + " reqFrom=" + new java.util.Date(reqStart)
+                                + " retry=" + desyncRetries + " — purging link");
+                        try {
+                            abortPendingBlockTransfer(port);
+                            drainPort(port);
+                            Thread.sleep(250);
+                            drainPort(port);
+                        } catch (Exception ignored) {}
+                        continue;
+                    }
                     // Records present but no new explicit timestamps (HPL rows without clock field)
                     seenPayloads.add(pageHex);
                     lpPageHexList.add(pageHex);
@@ -11197,13 +11246,20 @@ public class Reading extends AppCompatActivity {
         // before ever reaching the fallback, so no field data was collected. Probe
         // NOW, right after attr7, while the link is fresh: one page at the reported
         // top and one at the bottom, clocks logged. Failures are harmless.
-        if (entriesInUse > 0 && !abortRequested && !lpShouldAbort()) {
+        // V49: probe even when attr7 says 0 — Genus reported entries_in_use=0 on
+        // 09-07 18:48 (487 the day before; the attribute is flaky on both makes),
+        // which skipped the probes and we again learned nothing. With EIU=0 the
+        // top probe uses an estimate; the meter clamps or errors harmlessly.
+        int probeRecPerDay = (capturePeriodMin > 0) ? (24 * 60 / capturePeriodMin) : 96;
+        int probeTopEntry = (entriesInUse > 0) ? entriesInUse : (lsDays + 1) * probeRecPerDay;
+        if (!abortRequested && !lpShouldAbort()) {
             try {
-                StringBuilder pTop = lpGetByEntry(port, Math.max(1, entriesInUse - 2), entriesInUse, capturePeriodMin);
+                StringBuilder pTop = lpGetByEntry(port, Math.max(1, probeTopEntry - 2), probeTopEntry, capturePeriodMin);
                 String pTopHex = (pTop == null) ? "" : pTop.toString().trim();
                 java.util.TreeSet<Long> topSlots = new java.util.TreeSet<>();
                 if (!pTopHex.isEmpty()) collectLpTimestamps(pTopHex, topSlots);
-                appendLog("LP_ENTRY_PROBE_TOP entries=" + Math.max(1, entriesInUse - 2) + ".." + entriesInUse
+                appendLog("LP_ENTRY_PROBE_TOP entries=" + Math.max(1, probeTopEntry - 2) + ".." + probeTopEntry
+                        + (entriesInUse > 0 ? "" : " (estimated, attr7=0)")
                         + " records=" + topSlots.size()
                         + (topSlots.isEmpty() ? "" : (" clocks=" + new java.util.Date(topSlots.first())
                                 + ".." + new java.util.Date(topSlots.last()))));
@@ -11574,6 +11630,7 @@ public class Reading extends AppCompatActivity {
                         + " records | ETA ~" + etaStr);
                 boolean stalledReconnectDone = false; // V37: one reconnect attempt per LP read
                 int consecutiveEmptyDays = 0;         // V37: track consecutive NO_DATA days
+                int daySelDesyncs = 0;                // V49: max 6 DAY-SEL stale-response recoveries
                 // V38: Read newest-first (i=0=today → i=lsDays=oldest) so recent data is
                 // captured before any HDLC stall on older days cuts the session short.
                 for (int i = 0; i <= lsDays; i++) {
@@ -11604,6 +11661,40 @@ public class Reading extends AppCompatActivity {
 
                     if (DLMdata != null && !DLMdata.toString().isEmpty()) {
                         String lpHex = DLMdata.toString().trim();
+
+                        // V49: DAY-SEL DESYNC GUARD — the gap path has had this since
+                        // V47, but a stale echo answering the DAY request itself was
+                        // unguarded: 09-07 18:48 log, day -21 (Jun-18) received the
+                        // Jun-19 tail → classified EMPTY_SKIPPED (day lost, 0 records),
+                        // and day -22 (Jun-17) received the same stale frame so its
+                        // real day request was never made (closed at 12/97). A response
+                        // whose every clock lies wholly outside [midnight .. next
+                        // midnight] is a stale answer to an earlier request — purge
+                        // both sides and redo this day. The next-midnight boundary
+                        // record (00:00:00 of day+1) is legitimate and stays accepted.
+                        {
+                            java.util.TreeSet<Long> selChk = new java.util.TreeSet<>();
+                            collectLpTimestampsLoose(lpHex, selChk);
+                            long selDayStart   = dayDate.getTime();
+                            long selDayEndIncl = selDayStart + 24L * 3600_000L;
+                            if (!selChk.isEmpty()
+                                    && (selChk.last() < selDayStart || selChk.first() > selDayEndIncl)
+                                    && daySelDesyncs < 6) {
+                                daySelDesyncs++;
+                                appendLog("RLS_SEL_DAY_DESYNC day=-" + i
+                                        + " stale=" + new java.util.Date(selChk.first())
+                                        + ".." + new java.util.Date(selChk.last())
+                                        + " retry=" + daySelDesyncs + " — purging link");
+                                try {
+                                    abortPendingBlockTransfer(port);
+                                    drainPort(port);
+                                    Thread.sleep(250);
+                                    drainPort(port);
+                                } catch (Exception ignored) {}
+                                i--; // redo this day on a clean line
+                                continue;
+                            }
+                        }
 
                         // Filter: keep payload only if it appears to contain actual LP rows.
                         if (!hasLoadProfileRecords(lpHex)) {
