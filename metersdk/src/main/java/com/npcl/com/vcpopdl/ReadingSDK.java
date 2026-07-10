@@ -4252,52 +4252,17 @@ public class ReadingSDK {
             File logDir  = new File(baseDir, LOG_DIR_NAME);
             if (!logDir.exists()) logDir.mkdirs();
 
-            String todayDate = new SimpleDateFormat("yyyyMMdd")
-                    .format(new Date());
-            long oneDayMs = 24L * 60 * 60 * 1000;
-            long cutoff   = System.currentTimeMillis() - oneDayMs;
+            // One file per user — all meters/sessions append to SDK_OPTICAL_LOG_<user>.TXT
             String userTag = sanitizeForFileName(userIdWithName);
-            String roleTag = sanitizeForFileName(userRole);
-
-            // Purge files older than 1 day and find highest session index for today
-            int maxIdx = 0;
-            File[] existing = logDir.listFiles();
-            if (existing != null) {
-                for (File f : existing) {
-                    String name = f.getName();
-                    if (!name.startsWith(LOG_PREFIX) || !name.endsWith(LOG_SUFFIX)) continue;
-                    // Check if this file belongs to today
-                    if (name.contains(todayDate)) {
-                        // Extract trailing session index: SDK_OPTICAL_LOG_[user_]YYYYMMDD_N.TXT
-                        try {
-                            String core = name.substring(LOG_PREFIX.length(), name.length() - LOG_SUFFIX.length());
-                            int lastUnderscore = core.lastIndexOf('_');
-                            if (lastUnderscore >= 0) {
-                                int idx = Integer.parseInt(core.substring(lastUnderscore + 1));
-                                if (idx > maxIdx) maxIdx = idx;
-                            }
-                        } catch (Exception ignored) {}
-                    } else if (f.lastModified() < cutoff) {
-                        // Delete files older than 1 day
-                        f.delete();
-                    }
-                }
-            }
-
-            // Create new session file: SDK_OPTICAL_LOG_[user_][role_]YYYYMMDD_(N+1).TXT
-            int sessionIdx = maxIdx + 1;
-            String fileName = LOG_PREFIX
-                    + (userTag.isEmpty() ? "" : userTag + "_")
-                    + (roleTag.isEmpty() ? "" : roleTag + "_")
-                    + todayDate + "_" + sessionIdx + LOG_SUFFIX;
-            File logFile = new File(logDir, fileName);
+            String logFileName = LOG_PREFIX + (userTag.isEmpty() ? "DEFAULT" : userTag) + LOG_SUFFIX;
+            File logFile = new File(logDir, logFileName);
             currentLogPath = logFile.getAbsolutePath();
 
-            // Write session banner
+            // Append session banner (never truncate — all meter logs accumulate here)
             String ts = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
                     .format(new Date());
             BufferedWriter bw = new BufferedWriter(
-                    new FileWriter(logFile, false));
+                    new FileWriter(logFile, true));
             bw.write("==============================\r\n");
             bw.write("[" + ts + "] SESSION START"
                     + " | Make=" + meterMakeLabel
