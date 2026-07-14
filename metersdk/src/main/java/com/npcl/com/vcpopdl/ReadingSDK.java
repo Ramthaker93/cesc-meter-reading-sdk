@@ -1,3 +1,4 @@
+// VERSION: V52 — OPERATOR FEEDBACK + BILLING PING-PONG BOUND (14-07, from field log _14): (1) LIVE TRANSFER HEARTBEAT — billing/scaler/capture-object pulls run in GetParameter/GetParameter1 which never ticked progress; 14-07 session 1 billing crawled 320s on a weak optical coupling with no signal and the operator aborted a progressing read. New xferHeartbeat() logs progress every 3s (blocks · kB · elapsed) and flags 'SLOW LINK — hold coupler steady' after 45s on one object (no phase-dashboard UI in this SDK class, so this is a log-only heartbeat; the host app's phase dashboard equivalent lives in Reading.java). (2) GP BLOCK-LOOP BOUND — GetParameter's while(flag1) block pull had abortRequested as its ONLY exit: on a marginal link the meter answers every resend with a supervisory frame (each resets the retry counter, so no timeout can ever fire) → silent infinite ping-pong (320s, strbldLen=23013 of duplicates for a 6701-char object). Now: 120s/200-cycle budget (GP_BLOCK_BUDGET_ABORT) + 6-consecutive-supervisory-frames breaker (GP_RR_LOOP_BREAK); partial returned, caller's GP1 fallback still runs. GP1 already had 90s billingDeadline+consec-fail bounds — only heartbeat added. (3) SEL_ENTRY_FRAME FIX — String.format("%02X", byte) throws IllegalFormatConversionException (boxed Byte), silently caught since V50, which is why the dump appeared in NO field log; now masks to int. (4) LP_ENTRY_FALLBACK_SKIP — when both entry probes decode to zero records, the end-of-LP entry sweep (same frame, same fate, 16s/page) is skipped: 14-07 KT280549 burned 128s on probes+sweep for nothing. FIELD FACTS from log _14: billing 14-Jul-13:47:04 record absent because the MD reset raced the read (billing buffer pulled 13:46:58-13:47:20, reset stamped 13:47:04 — re-read gets it); post-reset the meter serves LP only back to ~Jul 5 10:45 (886 recs ≈ attr7=990) — Jun 8-19 mornings no longer retrievable optically.
 // VERSION: V51 — GPLS MULTI-BLOCK RESEND FIX + SECURE PROPRIETARY CURRENTS (13-07, from field log _13): (1) GPLS SELECTIVE BLOCK LOOP: the send do-while only exited after nTryCount timeouts — a SUCCESSFUL multi-block receive (flag3=true, num196=0) looped back and resent GetRequest(next) for the same block forever; KT280549 day -24 (Jun 19) answered in 2 blocks and the session sat silently 12:31:21→12:39:26 deadline (GPLS_SEL_BLOCK_ABORT block=1), losing the 8 minutes that would have re-read Jun 8-19 (those days remain 54/96 in DB from pre-V50 reads — a V51 re-read will fill them). Condition now 'while (!flag3 && …)' matching the sibling receive loop. Secure selective LP normally fits one 19-record block so this path never fired before. (2) SECURE ACTIVE/REACTIVE CURRENT (user-confirmed Secure-proprietary OBIS): instant read now requests active 1.0.161/163/165.7.0.255 and reactive 1.0.162/164/166.7.0.255 (alt family 1.0.37/57/77.7.0.255 when primary silent) on Secure only, first-OBIS probe with single try, attr=3 per register — the EDIS instant screen rows P2-2-x/P2-3-x were blank because the app never requested these. V50 field-verified in log _13: 96/96 per day (ladder fix), V=247-249/I incl. L1 correctly scaled via meter attr=3, SCALER_MISSING logs only on non-register objects. NOTE: log _13's APK is an INTERMEDIATE V50 build — SEL_ENTRY_FRAME dump and bottom-probe skip are missing from it; compile THIS file so the L&T selector-2 frame bytes finally get captured.
 // VERSION: V50 — METER-ONLY SCALERS + NEWEST-FIRST LADDER FIX (10-07, from V49 field logs _9/_10/_12 and KT280549 wrong V/I): FIELD RULE — every scaler must be COLLECTED from the meter, never derived or hardcoded. (1) appendMissingScalerLines no longer fabricates IS15959-2 table defaults into the TXT (KT280549 got '0007 01001F0700FF 03 02020FFD1621' sc=-3 fabricated while its true current scaler is -6 = 1000× error; only TOD T1-T8 inheriting the meter's OWN T0 scaler is kept; otherwise SCALER_MISSING + raw value). (2) ReadScalarUnit refactored: compound 5E5B03/04/05/06/07FF attr=3 retried once on a drained line when attr=2 answered but attr=3 didn't (KT280549 lost 5E5B03FF attr=3 → converter had scaler VALUES with no column list → V=24751610 raw in XML/DB instead of 247.52). (3) needIndivScalers now TRUE for all makes (OPT-4 reverted) + SCALER ATTR3 COMPLETENESS SWEEP at end of ReadInstantData: any '0003 <obis> 02' without matching attr=3 is re-requested once (both Secure TXTs show the FIRST attr=3 of the phase — 01001F0700FF — systematically dropped). (4) lpFillDayGaps: a page that ADDS records clears gapAttempts for the gap — newest-first makes (KT280549: 19 rec/page from range tail, gapStart fixed at 00:00) burned all 3 attempts on successful pages and closed every day at 54/96 (mornings 00:00-10:30 lost, confirmed in DB).
 // VERSION: V49 — DAY-LOSS DESYNC FIXES (09-07 18:48 V48 Genus read: V48 verified — session ended cleanly at 781s, TXT saved, 2667 records — but stale echoes still lost whole days): (1) DAY-SEL DESYNC GUARD — a stale echo answering the DAY request itself was unguarded (only the gap path had the V47 guard): day -21/Jun-18 received the Jun-19 tail → EMPTY_SKIPPED with 0 records, day -22/Jun-17 received the same frame and closed at 12/97 (DB proves the meter holds 96); response wholly outside [midnight..next-midnight] → purge + redo the day (max 6/read). (2) MANGLED-STALE IMPLICIT-CLOSE GUARD — head-mangled stale echoes have no STRICT clocks so the V47 desync guard never fired; they were accepted as 'rows without clock field' and closed the whole remaining range: every RLS_GAP_IMPLICIT day in the 18:48 log (Jun-17/21/22/25, Jul-01) sits partial in the DB; new collectLpTimestampsLoose() sees the mangled clocks — all predating reqFrom → RLS_GAP_DESYNC_MANGLED retry instead of close (HPL's genuine clockless rows have in-range loose stamps and keep closing normally). (3) ENTRY PROBES run even when attr7=0 (Genus reported 0 tonight vs 487 yesterday — flaky attribute skipped the probes again; top probe uses (lsDays+1)*recPerDay estimate). (4) SESSION CEILING 12→18s/day cap 1200 (measured real Genus pace ~21s/day incl. desync recoveries + ~90s preamble; 780s cut days -34/-35). NOTE: log 'GMT+05:30' labels are Java Date.toString() — GMT+05:30 IS IST, no offset error; but meter KT089348's RTC runs ~24 min behind IST (consistent across 15:29 and 18:48 reads) — needs a field time-sync, not a code change.
@@ -909,6 +910,26 @@ public class ReadingSDK {
         if (lpLastFrameMs > 0 && System.currentTimeMillis() - lpLastFrameMs > LP_IDLE_MS) return true;
         if (lpDeadlineMs  > 0 && System.currentTimeMillis() > lpDeadlineMs) return true;
         return false;
+    }
+
+    // V52: live progress feedback for NON-LP transfers. Billing buffer /
+    // capture-object / scaler-compound pulls run inside GetParameter and
+    // GetParameter1, which never emitted any progress — a weak optical
+    // coupling can crawl for minutes with no log signal at all. No phase
+    // dashboard exists in this SDK class (Android UI lives in the host app),
+    // so this logs a throttled (one per 3s) progress line instead, and flags
+    // a slow link after 45s on a single object so callers can surface it.
+    private long xferUiLastMs = 0;
+    private void xferHeartbeat(StringBuilder sb, long objStartMs, int cycles) {
+        try {
+            long now = System.currentTimeMillis();
+            if (now - xferUiLastMs < 3000) return;
+            xferUiLastMs = now;
+            long t = (now - objStartMs) / 1000L;
+            String d = cycles + " blk · " + (sb.length() / 2048L) + " kB · " + t + "s";
+            if (t > 45) d += " · SLOW LINK — hold coupler steady";
+            appendLog("XFER_PROGRESS " + d);
+        } catch (Exception ignored) {}
     }
 
     private void lpFrameReceived() {
@@ -4480,6 +4501,20 @@ public class ReadingSDK {
             this.fcs(this.nPkt, wp - 1, (byte) 1);
             this.nPkt[wp + 2] = (byte) 126;
             appendLog("SEL_ENTRY_REQ from=" + selEntryFrom + " to=" + selEntryTo);
+            // V50: all three 10-07 probes (Genus KT122607, Secure KT280549) got
+            // pure silence for selector-2 — HDLC-level discard means a frame
+            // fault, not an unsupported selector (that would return a
+            // Data-Access-Result error). Dump the exact bytes so the frame can
+            // be verified offline against the spec from the next field log.
+            try {
+                // V52: %02X with a boxed Byte throws IllegalFormatConversionException
+                // — the catch below swallowed it, so SEL_ENTRY_FRAME never appeared
+                // in ANY field log (_13, _14). Mask to int first.
+                StringBuilder fh = new StringBuilder();
+                for (int fi = 0; fi <= wp + 2; fi++)
+                    fh.append(String.format("%02X", 0xff & this.nPkt[fi]));
+                appendLog("SEL_ENTRY_FRAME " + fh);
+            } catch (Exception ignored) {}
         } else {
         byte[] numArray12 = this.nPkt;
         int index13 = (int) num34;
@@ -5750,11 +5785,13 @@ public class ReadingSDK {
                 }
             }
             // appendLog("flag1 ###" + flag1);
+            long gp1XferStart = System.currentTimeMillis(); // V52: progress heartbeat base
             while (flag1) {
                 if (abortRequested) {
                     appendLog("FLAG1_DEADLINE_BREAK strbldLen=" + strbldDLMdata.length());
                     break;
                 }
+                xferHeartbeat(strbldDLMdata, gp1XferStart, (int) num1);
                 // Auto-abort: 90-second wall-clock limit for the whole block transfer
                 if (System.currentTimeMillis() > billingDeadlineMs) {
                     appendLog("GP1_BILLING_DEADLINE strbldLen=" + strbldDLMdata.length());
@@ -6271,12 +6308,31 @@ public class ReadingSDK {
                     }
                 } else break;
             }
+            // V52: hard budget for the whole multi-block pull. 14-07 session 1:
+            // on a weak optical coupling the meter answered every resend with a
+            // supervisory frame — no timeout ever fired, num65 reset on each
+            // "success", and this loop ping-ponged SILENTLY for 320s (billing
+            // capture-objects, strbldLen=23013 of duplicates) until the operator
+            // aborted. abortRequested was the ONLY exit. 120s / 200 cycles turns
+            // that into a bounded partial return; the caller's fallback (GP1
+            // buffer pull) then still gets its chance on a drained line.
+            long gpBlkStartMs = System.currentTimeMillis();
+            int gpBlkCycles = 0;
+            int gpRrStreak = 0;
             while (flag1) {
                 // FIX: only abortRequested — lpDeadlineMs must not apply here
                 if (abortRequested) {
                     appendLog("FLAG1_DEADLINE_BREAK strbldLen=" + strbldDLMdata.length());
                     break;
                 }
+                ++gpBlkCycles;
+                if (System.currentTimeMillis() - gpBlkStartMs > 120_000L || gpBlkCycles > 200) {
+                    appendLog("GP_BLOCK_BUDGET_ABORT cycles=" + gpBlkCycles
+                            + " elapsed=" + ((System.currentTimeMillis() - gpBlkStartMs) / 1000L)
+                            + "s strbldLen=" + strbldDLMdata.length() + " — object abandoned, partial returned");
+                    break;
+                }
+                xferHeartbeat(strbldDLMdata, gpBlkStartMs, gpBlkCycles);
 
 
                 //     appendLog("Manu Here@#@#@#@#@");
@@ -6411,16 +6467,27 @@ public class ReadingSDK {
 
                     // appendLog("Time Haigoo Flag" +flag3);
                     if (flag3) {
-                        if ((int) this.nRcvPkt[((0xff & this.bytAddMode) + 5)] == 151 || ((int) this.nRcvPkt[((0xff & this.bytAddMode) + 5)] & 1) == 1)
+                        if ((int) this.nRcvPkt[((0xff & this.bytAddMode) + 5)] == 151 || ((int) this.nRcvPkt[((0xff & this.bytAddMode) + 5)] & 1) == 1) {
                             //return false;
                             SbData.append("");
-                        else
+                            // V52: supervisory/odd-control frame answered our block
+                            // request — legitimate once or twice, but a marginal link
+                            // returns these forever (each resets num65, so the resend
+                            // loop never times out). Six in a row on one object = dead.
+                            if (++gpRrStreak >= 6) {
+                                appendLog("GP_RR_LOOP_BREAK — " + gpRrStreak
+                                        + " consecutive supervisory frames, abandoning object");
+                                flag1 = false;
+                                break;
+                            }
+                        } else
                             break;
                     }
                 }
                 while ((int) num65 != (int) nTryCount);
 
                 //   appendLog("Need Break " + flag3 + "~" + (0xff & this.nRcvPkt[((0xff & this.bytAddMode) + 11)]) + "~" + (0xff & this.nRcvPkt[((0xff & this.bytAddMode) + 12)]));
+                if (flag3) gpRrStreak = 0; // V52: real data frame — supervisory streak over
                 if (flag3 && (int) (0xff & this.nRcvPkt[((0xff & this.bytAddMode) + 11)]) == 196 && (int) (0xff & this.nRcvPkt[((0xff & this.bytAddMode) + 12)]) == 2) {
                     // FIX: 4-byte big-endian block number decode
                     num1 = (((long)(this.nRcvPkt[((0xff & this.bytAddMode) + 15)] & 0xFF)) << 24)
@@ -9750,6 +9817,11 @@ public class ReadingSDK {
         // top probe uses an estimate; the meter clamps or errors harmlessly.
         int probeRecPerDay = (capturePeriodMin > 0) ? (24 * 60 / capturePeriodMin) : 96;
         int probeTopEntry = (entriesInUse > 0) ? entriesInUse : (lsDays + 1) * probeRecPerDay;
+        // V52: when both probes come back with zero records, entry access is dead
+        // on this meter for this session — the end-of-LP entry sweep uses the
+        // exact same lpGetByEntry frame and will fail identically, at 16s per
+        // page (14-07 KT280549: 2×16s probes + 6×16s sweep = 128s for nothing).
+        boolean entryAccessDead = false;
         if (!abortRequested && !lpShouldAbort()) {
             try {
                 StringBuilder pTop = lpGetByEntry(port, Math.max(1, probeTopEntry - 2), probeTopEntry, capturePeriodMin);
@@ -9761,13 +9833,26 @@ public class ReadingSDK {
                         + " records=" + topSlots.size()
                         + (topSlots.isEmpty() ? "" : (" clocks=" + new Date(topSlots.first())
                                 + ".." + new Date(topSlots.last()))));
-                StringBuilder pBot = lpGetByEntry(port, 1, 3, capturePeriodMin);
-                String pBotHex = (pBot == null) ? "" : pBot.toString().trim();
-                TreeSet<Long> botSlots = new TreeSet<>();
-                if (!pBotHex.isEmpty()) collectLpTimestamps(pBotHex, botSlots);
-                appendLog("LP_ENTRY_PROBE_BOTTOM entries=1..3 records=" + botSlots.size()
-                        + (botSlots.isEmpty() ? "" : (" clocks=" + new Date(botSlots.first())
-                                + ".." + new Date(botSlots.last()))));
+                // V50: pure silence on the TOP probe means the meter discards the
+                // selector-2 frame at HDLC level — the BOTTOM probe would only burn
+                // another timeout. The SEL_ENTRY_FRAME dump is what we need instead.
+                if (pTopHex.isEmpty()) {
+                    appendLog("LP_ENTRY_PROBE_SKIP_BOTTOM — no response to TOP, frame dump logged");
+                    entryAccessDead = true;
+                } else {
+                    StringBuilder pBot = lpGetByEntry(port, 1, 3, capturePeriodMin);
+                    String pBotHex = (pBot == null) ? "" : pBot.toString().trim();
+                    TreeSet<Long> botSlots = new TreeSet<>();
+                    if (!pBotHex.isEmpty()) collectLpTimestamps(pBotHex, botSlots);
+                    appendLog("LP_ENTRY_PROBE_BOTTOM entries=1..3 records=" + botSlots.size()
+                            + (botSlots.isEmpty() ? "" : (" clocks=" + new Date(botSlots.first())
+                                    + ".." + new Date(botSlots.last()))));
+                    // Probes "responded" but decoded to zero records on both ends
+                    // → selector-2 answers carry no data on this meter; sweep is futile.
+                    TreeSet<Long> topSlots2 = new TreeSet<>();
+                    collectLpTimestamps(pTopHex, topSlots2);
+                    if (topSlots2.isEmpty() && botSlots.isEmpty()) entryAccessDead = true;
+                }
             } catch (Exception probeEx) {
                 appendLog("LP_ENTRY_PROBE_EX: " + probeEx.getMessage());
             }
@@ -10382,6 +10467,10 @@ public class ReadingSDK {
                 for (String pg : lpPageHexList) collectLpTimestamps(pg, allGot);
                 long wantOldestMs = System.currentTimeMillis() - (long) lsDays * 86400000L;
                 long oldestGotMs = allGot.isEmpty() ? Long.MAX_VALUE : allGot.first();
+                if (entryAccessDead && oldestGotMs > wantOldestMs + 86400000L) {
+                    appendLog("LP_ENTRY_FALLBACK_SKIP — entry probes returned no records this"
+                            + " session; sweep would burn 16s/page for nothing (V52)");
+                } else
                 if (oldestGotMs > wantOldestMs + 86400000L) {
                     long entryHi = (entriesInUse > 0)
                             ? (long) entriesInUse
