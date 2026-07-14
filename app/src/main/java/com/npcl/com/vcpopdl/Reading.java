@@ -1,3 +1,4 @@
+// VERSION: V51 — GPLS MULTI-BLOCK RESEND FIX + SECURE PROPRIETARY CURRENTS (13-07, from field log _13): (1) GPLS SELECTIVE BLOCK LOOP: the send do-while only exited after nTryCount timeouts — a SUCCESSFUL multi-block receive (flag3=true, num196=0) looped back and resent GetRequest(next) for the same block forever; KT280549 day -24 (Jun 19) answered in 2 blocks and the session sat silently 12:31:21→12:39:26 deadline (GPLS_SEL_BLOCK_ABORT block=1), losing the 8 minutes that would have re-read Jun 8-19 (those days remain 54/96 in DB from pre-V50 reads — a V51 re-read will fill them). Condition now 'while (!flag3 && …)' matching the sibling receive loop. Secure selective LP normally fits one 19-record block so this path never fired before. (2) SECURE ACTIVE/REACTIVE CURRENT (user-confirmed Secure-proprietary OBIS): instant read now requests active 1.0.161/163/165.7.0.255 and reactive 1.0.162/164/166.7.0.255 (alt family 1.0.37/57/77.7.0.255 when primary silent) on Secure only, first-OBIS probe with single try, attr=3 per register — the EDIS instant screen rows P2-2-x/P2-3-x were blank because the app never requested these. V50 field-verified in log _13: 96/96 per day (ladder fix), V=247-249/I incl. L1 correctly scaled via meter attr=3, SCALER_MISSING logs only on non-register objects. NOTE: log _13's APK is an INTERMEDIATE V50 build — SEL_ENTRY_FRAME dump and bottom-probe skip are missing from it; compile THIS file so the L&T selector-2 frame bytes finally get captured.
 // VERSION: V50 — METER-ONLY SCALERS + NEWEST-FIRST LADDER FIX (10-07, from V49 field logs _9/_10/_12 and KT280549 wrong V/I): FIELD RULE — every scaler must be COLLECTED from the meter, never derived or hardcoded. (1) appendMissingScalerLines no longer fabricates IS15959-2 table defaults into the TXT (KT280549 got '0007 01001F0700FF 03 02020FFD1621' sc=-3 fabricated while its true current scaler is -6 = 1000× error; only TOD T1-T8 inheriting the meter's OWN T0 scaler is kept; otherwise SCALER_MISSING + raw value). (2) ReadScalarUnit refactored: compound 5E5B03/04/05/06/07FF attr=3 retried once on a drained line when attr=2 answered but attr=3 didn't (KT280549 lost 5E5B03FF attr=3 → converter had scaler VALUES with no column list → V=24751610 raw in XML/DB instead of 247.52). (3) needIndivScalers now TRUE for all makes (OPT-4 reverted) + SCALER ATTR3 COMPLETENESS SWEEP at end of ReadInstantData: any '0003 <obis> 02' without matching attr=3 is re-requested once (both Secure TXTs show the FIRST attr=3 of the phase — 01001F0700FF — systematically dropped). (4) lpFillDayGaps: a page that ADDS records clears gapAttempts for the gap — newest-first makes (KT280549: 19 rec/page from range tail, gapStart fixed at 00:00) burned all 3 attempts on successful pages and closed every day at 54/96 (mornings 00:00-10:30 lost, confirmed in DB).
 // VERSION: V49 — DAY-LOSS DESYNC FIXES (09-07 18:48 V48 Genus read: V48 verified — session ended cleanly at 781s, TXT saved, 2667 records — but stale echoes still lost whole days): (1) DAY-SEL DESYNC GUARD — a stale echo answering the DAY request itself was unguarded (only the gap path had the V47 guard): day -21/Jun-18 received the Jun-19 tail → EMPTY_SKIPPED with 0 records, day -22/Jun-17 received the same frame and closed at 12/97 (DB proves the meter holds 96); response wholly outside [midnight..next-midnight] → purge + redo the day (max 6/read). (2) MANGLED-STALE IMPLICIT-CLOSE GUARD — head-mangled stale echoes have no STRICT clocks so the V47 desync guard never fired; they were accepted as 'rows without clock field' and closed the whole remaining range: every RLS_GAP_IMPLICIT day in the 18:48 log (Jun-17/21/22/25, Jul-01) sits partial in the DB; new collectLpTimestampsLoose() sees the mangled clocks — all predating reqFrom → RLS_GAP_DESYNC_MANGLED retry instead of close (HPL's genuine clockless rows have in-range loose stamps and keep closing normally). (3) ENTRY PROBES run even when attr7=0 (Genus reported 0 tonight vs 487 yesterday — flaky attribute skipped the probes again; top probe uses (lsDays+1)*recPerDay estimate). (4) SESSION CEILING 12→18s/day cap 1200 (measured real Genus pace ~21s/day incl. desync recoveries + ~90s preamble; 780s cut days -34/-35). NOTE: log 'GMT+05:30' labels are Java Date.toString() — GMT+05:30 IS IST, no offset error; but meter KT089348's RTC runs ~24 min behind IST (consistent across 15:29 and 18:48 reads) — needs a field time-sync, not a code change.
 // VERSION: V48 — DEADLINE SPIN-LOOP HANG FIX (09-07 17:03 V47 Genus read: log ends exactly at the 780s deadline mid-request, session then hung SILENTLY ~7 min until user abort; TXT never saved, 23 days of data lost): TWO receive loops in GetParameterSelective break their inner loop on lpShouldAbort() but never release the outer retry loop, which resends the RR and spins forever (log flood unflushed) — (a) FIX-O4 RR loop: num121=nTryCount on abort (SEL_RR_DEADLINE), (b) SEG RR loop: num197=nTryCount + flag1=false (GPLS_SEG_ABORT '— loops released'); same bug class the GPLS_SEL_BLOCK_ABORT comment fixed earlier, missed in these two. MAKE-AGNOSTIC: these loops serve every make (the RR path exists for L&T window=7), so any make crossing the deadline mid-segment would hang identically. ALSO: (c) desync retry now settles 250ms + drains twice (echoed frame can still be in flight at first drain — 17:03 log shows repeat desyncs retry=2/3 on the same gap); (d) EARLY entry-numbering probes right after attr7 (LP_ENTRY_PROBE_TOP/BOTTOM, ~2s, harmless) — collects the per-make entry semantics even when LP dies later, which the 17:03 abort prevented. V47 desync guard verified working (correct detection + recovery each time, RLS_GAP_DONE follows).
@@ -6776,7 +6777,16 @@ public class Reading extends AppCompatActivity {
                 // label_129:
 
             }
-            while ((int) num196 != (int) nTryCount);
+            // V51: a SUCCESSFUL receive (flag3=true, num196 reset to 0) must exit
+            // this send loop — the old condition only exited after nTryCount
+            // timeouts, so every multi-block C4-02 response made this loop resend
+            // GetRequest(next) for the SAME block forever. 13-07 KT280549 log:
+            // day -24 (Jun 19) answered in 2 blocks and the session sat here
+            // SILENTLY from 12:31:21 to the 12:39:26 deadline (GPLS_SEL_BLOCK_ABORT
+            // block=1) — the 8 minutes that would have re-read Jun 8-19. Secure
+            // selective LP normally fits one 19-record block, which is why this
+            // path never fired before.
+            while (!flag3 && (int) num196 != (int) nTryCount);
             if (flag3 && (int) this.nRcvPkt[((0xff & this.bytAddMode) + 11)] == 196 && (int) this.nRcvPkt[((0xff & this.bytAddMode) + 12)] == 2)
             {
                 // num1 = long.Parse(... hex parse comment ...);
@@ -12467,6 +12477,50 @@ public class Reading extends AppCompatActivity {
         DLMdata = this.GetParameter(port, (byte) 3, "0100470700FF", (byte) 2,
                 this.bytWait, this.bytTryCnt, this.bytTimOut, true, strbldDLMdata);
         if (hasMeaningfulDlmsPayload(DLMdata)) strbldDLMdata.append(DLMdata);
+
+        // V51: Secure PROPRIETARY per-phase ACTIVE/REACTIVE current (user-confirmed
+        // Secure-only OBIS). The EDIS catalogue expects P2-2-x (Active Current) and
+        // P2-3-x (Reactive Current) — modem CDF reads deliver them but this app
+        // never requested the registers, so optical Secure reads showed blank
+        // active/reactive current on the instant screen (KT280549, 13-07).
+        // Families: active 1.0.161/163/165.7.0.255; reactive 1.0.162/164/166.7.0.255
+        // with 1.0.37/57/77.7.0.255 as the alternate reactive family on older
+        // firmware. The FIRST OBIS of each family is probed with a single try —
+        // if the meter is silent the whole family is skipped (no time wasted),
+        // and the alternate reactive family is only tried when the primary one
+        // is absent. attr=3 is collected per register (meter-only scaler rule);
+        // the completeness sweep below catches any attr=3 that slips through.
+        if (isSecure) {
+            String[][] secCurFams = {
+                { "0100A10700FF", "0100A30700FF", "0100A50700FF" },  // active current R/Y/B
+                { "0100A20700FF", "0100A40700FF", "0100A60700FF" },  // reactive current R/Y/B
+                { "0100250700FF", "0100390700FF", "01004D0700FF" },  // reactive current R/Y/B (alt family)
+            };
+            boolean reactiveDone = false;
+            for (int fi = 0; fi < secCurFams.length; fi++) {
+                if (fi == 2 && reactiveDone) continue; // primary reactive family answered
+                String[] fam = secCurFams[fi];
+                DLMdata = this.GetParameter(port, (byte) 3, fam[0], (byte) 2,
+                        this.bytWait, (byte) 1, this.bytTimOut, true, strbldDLMdata);
+                if (!hasMeaningfulDlmsPayload(DLMdata)) {
+                    appendLog("SECURE_CUR_FAM_SKIP obis=" + fam[0] + " — no response, family skipped");
+                    continue;
+                }
+                strbldDLMdata.append(DLMdata);
+                if (fi >= 1) reactiveDone = true;
+                DLMdata = this.GetParameter(port, (byte) 3, fam[0], (byte) 3,
+                        this.bytWait, (byte) 1, this.bytTimOut, true, strbldDLMdata);
+                if (hasMeaningfulDlmsPayload(DLMdata)) strbldDLMdata.append(DLMdata);
+                for (int sci = 1; sci < fam.length; sci++) {
+                    DLMdata = this.GetParameter(port, (byte) 3, fam[sci], (byte) 3,
+                            this.bytWait, (byte) 1, this.bytTimOut, true, strbldDLMdata);
+                    if (hasMeaningfulDlmsPayload(DLMdata)) strbldDLMdata.append(DLMdata);
+                    DLMdata = this.GetParameter(port, (byte) 3, fam[sci], (byte) 2,
+                            this.bytWait, (byte) 1, this.bytTimOut, true, strbldDLMdata);
+                    if (hasMeaningfulDlmsPayload(DLMdata)) strbldDLMdata.append(DLMdata);
+                }
+            }
+        }
 
         // Voltage L1
         DLMdata = this.GetParameter(port, (byte) 3, "0100200700FF", (byte) 3,
