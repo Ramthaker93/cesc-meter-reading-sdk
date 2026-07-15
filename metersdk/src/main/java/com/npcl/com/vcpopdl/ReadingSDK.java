@@ -229,6 +229,88 @@ public class ReadingSDK {
     // 0=success/unknown, 1=ACCESS_ERROR (session alive), 2=timeout/no-response/DM
     private int lastGplsResult = 0;
 
+    // ── V53 LINK-STATE MANAGER ────────────────────────────────────────────────
+    // The HDLC N(S)/N(R) window counters are INFERRED from received frames
+    // (FrameType()); any truncated/aborted transfer leaves frames unread and the
+    // counters drift. A desynced meter silently IGNORES the next I-frame (log
+    // _15: GPLS_TIMEOUT nCounter=0 on both makes), so every later read in the
+    // session returns empty and gets misread as "meter has no data". This is
+    // the Gurux model: sequence state is only trustworthy after SNRM resets it
+    // on both sides; after any failed exchange, re-associate before reusing the
+    // link. linkDirty is set at EVERY abnormal transaction exit; healLink()
+    // (AddressInit+SNRM+AARQ+drain, ~1.5s, the exact recipe that already worked
+    // as EVENT_DM_BEFORE_ATTR2 in log _15) runs before the next request.
+    private boolean linkDirty = false;
+    private String  linkDirtyReason = "";
+    private int     linkHealCount = 0;      // per-session heal counter (diagnostics)
+    private boolean gp1Aborted = false;     // set when a billing block transfer is cut short
+    private final java.util.ArrayList<String> sectionWarnings = new java.util.ArrayList<>();
+    private int midnightRecCount = -1;      // records actually secured by ReadMidnightSnapshot
+    private int midnightEiuSeen  = -1;      // entries_in_use the meter reported
+
+    private void markLinkDirty(String reason) {
+        if (!linkDirty)
+            appendLog("LINK_DIRTY reason=" + reason);
+        linkDirty = true;
+        linkDirtyReason = reason;
+    }
+
+    /** Re-establish HDLC+COSEM after a failed exchange. Returns true on success. */
+    private boolean healLink(UsbSerialPort port, String tag) {
+        appendLog("LINK_HEAL start #" + (++linkHealCount) + " (" + linkDirtyReason + ") at " + tag);
+        try {
+            drainPort(port);
+            android.os.SystemClock.sleep(150);
+            AddressInit();
+            boolean nrmOk = SetNRM(port, this.bytWait, (byte) 2, this.bytTimOut);
+            if (!nrmOk) { appendLog("LINK_HEAL_NRM_FAIL " + tag); return false; }
+            String pw = currentMeterMake.getPassword();
+            int aarqRes = AARQ(port, (byte) 1, pw, this.bytWait, (byte) 2, this.bytTimOut);
+            if (aarqRes != 0) { appendLog("LINK_HEAL_AARQ_FAIL res=" + aarqRes + " " + tag); return false; }
+            drainPort(port);
+            linkDirty = false;
+            linkDirtyReason = "";
+            lastGplsResult = 0;
+            appendLog("LINK_HEAL_OK " + tag);
+            return true;
+        } catch (Exception e) {
+            appendLog("LINK_HEAL_EX " + e.getMessage() + " " + tag);
+            return false;
+        }
+    }
+
+    /** Heal-at-entry guard: called at the top of every transaction function. */
+    private void relinkIfDirty(UsbSerialPort port, String tag) {
+        if (linkDirty && !abortRequested)
+            healLink(port, tag);
+    }
+
+    /**
+     * V53: after healLink() resets the HDLC window (SNRM zeroes both sides,
+     * AARQ advances them deterministically), the pending GET request frame in
+     * nPkt still carries the OLD N(S)/N(R) bits in its control byte — resending
+     * it unchanged would be ignored just like before the heal. Rewrite the
+     * I-frame control byte from the current counters and recompute both FCS
+     * fields (header HCS over [1..ctrl], frame FCS over [1..sendLen-4]).
+     * sendLen = total frame length including both 0x7E flags.
+     */
+    private void refreshRequestSequence(int sendLen) {
+        int addrOff = 0xff & this.bytAddMode;
+        byte ctrl = (byte) (((this.nRecvCntr & 7) << 5) | 0x10 | ((this.nSentCntr & 7) << 1));
+        this.nPkt[addrOff + 5] = ctrl;
+        this.fcs(this.nPkt, addrOff + 5, (byte) 1);
+        this.fcs(this.nPkt, sendLen - 4, (byte) 1);
+    }
+
+    /** V53: count profile-generic records by their 12-byte clock stamps (090c). */
+    private static int countClockStamps(CharSequence data) {
+        if (data == null) return 0;
+        String hex = data.toString().toLowerCase();
+        int n = 0, i = 0;
+        while ((i = hex.indexOf("090c", i)) >= 0) { n++; i += 4; }
+        return n;
+    }
+
     // Diagnostic log
     private static final String LOG_DIR_NAME  = "CescRaj_SDK_LOGS";
     private static final String LOG_PREFIX    = "SDK_OPTICAL_LOG_";
@@ -662,6 +744,15 @@ public class ReadingSDK {
                                 + new SimpleDateFormat("HH:mm:ss", Locale.US)
                                 .format(new Date(sessionDeadlineMs)));
 
+                        // V53: reset link-state manager + honest-status collectors per session
+                        linkDirty = false;
+                        linkDirtyReason = "";
+                        linkHealCount = 0;
+                        gp1Aborted = false;
+                        sectionWarnings.clear();
+                        midnightRecCount = -1;
+                        midnightEiuSeen  = -1;
+
                         // Helper: remaining budget in ms (floor 0)
                         // Used to size LP budget and skip phases when time is up.
 
@@ -767,8 +858,24 @@ public class ReadingSDK {
                                 fireProgress(callback, "Downloading Midnight Snapshot... (5-10s)", 48);
                                 MeterData.append(ReadMidnightSnapshot(port, lsDays));
                                 long tMidElapsed = System.currentTimeMillis() - tMidStart;
-                                fireProgress(callback, "✓ Midnight done (" + (tMidElapsed/1000) + "s)", 52);
-                                UpdateStatus(CescRajMeterno, "Midnight OK");
+                                // V53: honest per-section status — "Midnight OK" used to be
+                                // fired even when 0 records were secured for a meter that
+                                // reported days of data, and the operator walked away with nothing.
+                                if (midnightEiuSeen > 0 && midnightRecCount == 0) {
+                                    fireProgress(callback, "WARN: ✗ Midnight FAILED — meter has "
+                                            + midnightEiuSeen + " days, none read (" + (tMidElapsed/1000) + "s)", 52);
+                                    UpdateStatus(CescRajMeterno, "Midnight FAILED");
+                                } else if (midnightEiuSeen > 0
+                                        && midnightRecCount < Math.min(midnightEiuSeen, lsDays + 1)) {
+                                    fireProgress(callback, "WARN: ⚠ Midnight PARTIAL — " + midnightRecCount
+                                            + " of ~" + Math.min(midnightEiuSeen, lsDays + 1)
+                                            + " days (" + (tMidElapsed/1000) + "s)", 52);
+                                    UpdateStatus(CescRajMeterno, "Midnight PARTIAL " + midnightRecCount);
+                                } else {
+                                    fireProgress(callback, "✓ Midnight done — " + Math.max(midnightRecCount, 0)
+                                            + " days (" + (tMidElapsed/1000) + "s)", 52);
+                                    UpdateStatus(CescRajMeterno, "Midnight OK");
+                                }
                                 flushLog();
 
                                 // ── Phase 4: Events ──────────────────────────────────────
@@ -822,6 +929,7 @@ public class ReadingSDK {
                                             String reason = (lpFrameCount == 0) ? "no response"
                                                     : lpIdleHit ? "meter idle" : "session cap";
                                             fireProgress(callback, "WARN: ⚠ LP partial — " + lpFrameCount + " fr (" + reason + ") " + (lpElapsed/1000) + "s", 78);
+                                            sectionWarnings.add("Load Profile PARTIAL (" + reason + ")"); // V53
                                         } else {
                                             fireProgress(callback, "✓ Load Profile — " + lpFrameCount + " fr · " + lpKb + " kB (" + (lpElapsed/1000) + "s)", 78);
                                         }
@@ -846,8 +954,20 @@ public class ReadingSDK {
                         // Restore originals
                         bytTimOut = origTimOut;
                         bytTryCnt = origTryCnt;
-                        UpdateStatus(CescRajMeterno, "All data OK");
-                        fireProgress(callback, "✓ Complete read OK (" + (sessionElapsed/1000) + "s)", 80);
+                        // V53: honest session verdict — log _15 declared "All data OK" on a
+                        // session whose midnight AND load profile were completely empty.
+                        if (linkHealCount > 0)
+                            appendLog("SESSION_LINK_HEALS=" + linkHealCount);
+                        if (sectionWarnings.isEmpty()) {
+                            UpdateStatus(CescRajMeterno, "All data OK");
+                            fireProgress(callback, "✓ Complete read OK (" + (sessionElapsed/1000) + "s)", 80);
+                        } else {
+                            String warnList = android.text.TextUtils.join("; ", sectionWarnings);
+                            appendLog("SESSION_WARNINGS: " + warnList);
+                            UpdateStatus(CescRajMeterno, "Done with WARNINGS: " + warnList);
+                            fireProgress(callback, "WARN: ⚠ Read finished with issues — " + warnList
+                                    + " (" + (sessionElapsed/1000) + "s). Consider re-reading.", 80);
+                        }
                         break;
                     }
                 }
@@ -4365,7 +4485,7 @@ public class ReadingSDK {
     {
         StringBuilder SbData = new StringBuilder();
 
-
+        relinkIfDirty(port, "GPS:" + sOBISCode + ":a" + nAttribID); // V53
         appendLog("New Fun -1 " + dateStartDate);
         boolean flag1 = false;
         long num1 = 0L;
@@ -4984,9 +5104,16 @@ public class ReadingSDK {
                 this.FrameType();
             } else {
                 ++num184;
+                // V53: total silence = likely desynced HDLC window — heal before resend
+                if ((int) num184 != (int) nTryCount) {
+                    markLinkDirty("GPS_TIMEOUT " + sOBISCode);
+                    if (healLink(port, "GPS-retry:" + sOBISCode))
+                        refreshRequestSequence(selSendLen);
+                }
             }
         }
         while (!flag2 && (int) num184 != (int) nTryCount);
+        if (!flag2) markLinkDirty("GPS_NO_RESPONSE " + sOBISCode); // V53
 
         // appendLog("Loop Outer Cunter" +flag2);
         this.lastSelHadResponse = flag2; // V45: callers distinguish confirmed-empty from timeout
@@ -5076,6 +5203,7 @@ public class ReadingSDK {
                         // forever once the deadline passed
                         num121 = nTryCount;
                         appendLog("SEL_RR_DEADLINE — outer RR loop released");
+                        markLinkDirty("SEL_RR_DEADLINE"); // V53
                         break;
                     }
                     this.DataReceive(port);
@@ -5277,6 +5405,7 @@ public class ReadingSDK {
                         flag1 = false;
                         num196 = nTryCount; // force outer do-while to exit too
                         appendLog("GPLS_SEL_BLOCK_ABORT block=" + num1);
+                        markLinkDirty("GPLS_SEL_BLOCK_ABORT"); // V53
                         break;
                     }
                     this.DataReceive(port);
@@ -5387,6 +5516,7 @@ public class ReadingSDK {
                             num197 = nTryCount;
                             flag1 = false;
                             appendLog("GPLS_SEG_ABORT block=" + num1 + " — loops released");
+                            markLinkDirty("GPLS_SEG_ABORT"); // V53
                             break;
                         }
 
@@ -5474,6 +5604,7 @@ public class ReadingSDK {
     private StringBuilder GetParameter1(UsbSerialPort port,byte nClassID, String sOBISCode, byte nAttribID, int nWait, byte nTryCount, byte nTimeOut, boolean isDLM,  StringBuilder strbldDLMdata) {
         StringBuilder SbData = new StringBuilder();
         SbData.append("");
+        relinkIfDirty(port, "GP1:" + sOBISCode + ":a" + nAttribID); // V53
         try {
             //   appendLog("nRetLSH" + nRetLSH);
             //   appendLog("nRecvCntr" + nRecvCntr);
@@ -5614,9 +5745,16 @@ public class ReadingSDK {
                     this.FrameType();
                 } else {
                     ++num33;
+                    // V53: total silence = likely desynced HDLC window — heal before resend
+                    if ((int) num33 != (int) nTryCount) {
+                        markLinkDirty("GP1_TIMEOUT " + sOBISCode);
+                        if (healLink(port, "GP1-retry:" + sOBISCode))
+                            refreshRequestSequence(num31 + 3);
+                    }
                 }
             }
             while (!flag2 && (int) num33 != (int) nTryCount);
+            if (!flag2) markLinkDirty("GP1_NO_RESPONSE " + sOBISCode); // V53
 
             appendLog("after 1 loop");
 
@@ -5690,6 +5828,7 @@ public class ReadingSDK {
                 if (abortRequested || (billingDeadlineMs > 0 && System.currentTimeMillis() > billingDeadlineMs)) {
                     appendLog("GP1_MOREBLOCKS_DEADLINE_ABORT frame=" + contFrameCount
                             + " — billingDeadline exceeded in moreBlocks loop");
+                    markLinkDirty("GP1_MOREBLOCKS_DEADLINE_ABORT"); gp1Aborted = true; // V53
                     break;
                 }
                 this.nPkt[2] = (byte) ((int) this.bytAddMode + 7);
@@ -5776,6 +5915,7 @@ public class ReadingSDK {
                     if (!flag3) {
                         SbData.append("");
                         appendLog("GPLS_CONT_FAIL frame=" + contFrameCount + " — breaking HDLC segment loop");
+                        markLinkDirty("GP1_CONT_FAIL"); // V53
                         gp1ConsecFail++;          // track consecutive segment failures
                         break;
                     }
@@ -5789,6 +5929,7 @@ public class ReadingSDK {
             while (flag1) {
                 if (abortRequested) {
                     appendLog("FLAG1_DEADLINE_BREAK strbldLen=" + strbldDLMdata.length());
+                    markLinkDirty("FLAG1_DEADLINE_BREAK"); // V53
                     break;
                 }
                 xferHeartbeat(strbldDLMdata, gp1XferStart, (int) num1);
@@ -5801,6 +5942,7 @@ public class ReadingSDK {
                 if (gp1ConsecFail >= GP1_FAIL_MAX) {
                     appendLog("GP1_CONSEC_FAIL_ABORT failCount=" + gp1ConsecFail
                             + " strbldLen=" + strbldDLMdata.length());
+                    markLinkDirty("GP1_CONSEC_FAIL_ABORT"); gp1Aborted = true; // V53
                     break;
                 }
 
@@ -5899,6 +6041,7 @@ public class ReadingSDK {
                             || System.currentTimeMillis() > blockDeadlineMs) {
                         appendLog("GP1_BLOCK_DEADLINE_ABORT blockNum=" + num1
                                 + " — billingDeadline or blockDeadline(30s) or abort");
+                        markLinkDirty("GP1_BLOCK_DEADLINE_ABORT"); gp1Aborted = true; // V53
                         flag3 = false;
                         num65 = nTryCount;
                         break;
@@ -6022,6 +6165,7 @@ public class ReadingSDK {
     private StringBuilder GetParameter(UsbSerialPort port,byte nClassID, String sOBISCode, byte nAttribID, int nWait, byte nTryCount, byte nTimeOut, boolean isDLM,  StringBuilder strbldDLMdata) {
         StringBuilder SbData = new StringBuilder();
         SbData.append("");
+        relinkIfDirty(port, "GP:" + sOBISCode + ":a" + nAttribID); // V53
         try {
             //appendLog("nRetLSH" + nRetLSH);
             // appendLog("nRecvCntr" + nRecvCntr);
@@ -6161,9 +6305,16 @@ public class ReadingSDK {
                     this.FrameType();
                 } else {
                     ++num33;
+                    // V53: total silence = likely desynced HDLC window — heal before resend
+                    if ((int) num33 != (int) nTryCount) {
+                        markLinkDirty("GP_TIMEOUT " + sOBISCode);
+                        if (healLink(port, "GP-retry:" + sOBISCode))
+                            refreshRequestSequence(num31 + 3);
+                    }
                 }
             }
             while (!flag2 && (int) num33 != (int) nTryCount);
+            if (!flag2) markLinkDirty("GP_NO_RESPONSE " + sOBISCode); // V53
 
             // Fast-fail: if we got a valid HDLC frame but it's an ACCESS_ERROR (result!=0),
             // the meter definitively rejected this request — retrying wastes 9s per attempt.
@@ -6304,6 +6455,7 @@ public class ReadingSDK {
                     if (!flag3) {
                         SbData.append("");
                         appendLog("GPLS_CONT_FAIL frame=" + contFrameCount + " — breaking HDLC segment loop");
+                        markLinkDirty("GP_CONT_FAIL"); // V53
                         break;
                     }
                 } else break;
@@ -6323,6 +6475,7 @@ public class ReadingSDK {
                 // FIX: only abortRequested — lpDeadlineMs must not apply here
                 if (abortRequested) {
                     appendLog("FLAG1_DEADLINE_BREAK strbldLen=" + strbldDLMdata.length());
+                    markLinkDirty("FLAG1_DEADLINE_BREAK"); // V53
                     break;
                 }
                 ++gpBlkCycles;
@@ -6330,6 +6483,7 @@ public class ReadingSDK {
                     appendLog("GP_BLOCK_BUDGET_ABORT cycles=" + gpBlkCycles
                             + " elapsed=" + ((System.currentTimeMillis() - gpBlkStartMs) / 1000L)
                             + "s strbldLen=" + strbldDLMdata.length() + " — object abandoned, partial returned");
+                    markLinkDirty("GP_BLOCK_BUDGET_ABORT"); // V53
                     break;
                 }
                 xferHeartbeat(strbldDLMdata, gpBlkStartMs, gpBlkCycles);
@@ -6410,6 +6564,7 @@ public class ReadingSDK {
                     // FIX: Check billing deadline inside block-transfer retry loop
                     if (lpShouldAbort()) {
                         appendLog("GP1_BLOCK_DEADLINE_ABORT blockNum=" + num1 + " — deadline or abort");
+                        markLinkDirty("GP_BLOCK_DEADLINE_ABORT"); gp1Aborted = true; // V53
                         flag3 = false;
                         num65 = nTryCount;
                         break;
@@ -6477,6 +6632,7 @@ public class ReadingSDK {
                             if (++gpRrStreak >= 6) {
                                 appendLog("GP_RR_LOOP_BREAK — " + gpRrStreak
                                         + " consecutive supervisory frames, abandoning object");
+                                markLinkDirty("GP_RR_LOOP_BREAK"); // V53
                                 flag1 = false;
                                 break;
                             }
@@ -6603,6 +6759,7 @@ public class ReadingSDK {
 
         StringBuilder SbData = new StringBuilder();
         final int addrOff = 0xff & this.bytAddMode;
+        relinkIfDirty(port, "GPLS:" + sOBISCode + ":a" + nAttribID); // V53
         lastGplsResult = 0; // reset per-call; set to 1 (ACCESS_ERROR) or 2 (timeout/UNKNOWN_FRAME) below
 
         try {
@@ -6687,6 +6844,15 @@ public class ReadingSDK {
                     appendLog("GPLS_TIMEOUT OBIS=" + sOBISCode + " attr=" + nAttribID
                             + " retry=" + retries + " elapsed=" + elapsed + "ms nCounter=" + nCounter);
                     retries++;
+                    // V53: nCounter==0 means the meter IGNORED the request — the classic
+                    // symptom of a desynced HDLC window after a truncated transfer.
+                    // Resending the same frame on a dead window is ALWAYS ignored;
+                    // re-associate first so the retry has a chance.
+                    if ((int)retries < (int)nTryCount) {
+                        markLinkDirty("GPLS_TIMEOUT " + sOBISCode);
+                        if (healLink(port, "GPLS-retry:" + sOBISCode + ":a" + nAttribID))
+                            refreshRequestSequence(sendLen);
+                    }
                 }
             } while (!gotResponse && (int)retries < (int)nTryCount);
 
@@ -6696,6 +6862,7 @@ public class ReadingSDK {
 
             if (!gotResponse) {
                 lastGplsResult = 2; // timeout/no-response — possible session drop
+                markLinkDirty("GPLS_NO_RESPONSE " + sOBISCode); // V53
                 SbData.append(strbldDLMdata);
                 return SbData;
             }
@@ -6712,6 +6879,7 @@ public class ReadingSDK {
             if ((this.nRcvPkt[addrOff + 5] & 0xff) == 0x97
                     || ((this.nRcvPkt[addrOff + 5] & 0xff) & 1) == 1) {
                 appendLog("GPLS_ERROR_FRAME OBIS=" + sOBISCode);
+                markLinkDirty("GPLS_ERROR_FRAME"); // V53
                 lastGplsResult = 2; // DM/error frame = session dead, treat as timeout
                 SbData.append(strbldDLMdata);
                 return SbData;
@@ -8759,8 +8927,28 @@ public class ReadingSDK {
         }
         if (!usedSelectiveAccess) {
             // Complete mode or selective access failed/not applicable: full buffer pull.
+            gp1Aborted = false; // V53: armed — set by GP1_*_ABORT exits during this read
             DLMdata = this.GetParameter1(port, (byte) 7, "0100620100FF", (byte) 2,
                     this.bytWait, this.bytTryCnt, this.bytTimOut, true, strbldDLMdata);
+            // V53: a billing block transfer cut short silently loses the NEWEST billing
+            // records — exactly the "billing history missing" complaint. Heal the link
+            // and re-read once; keep whichever result carries more records.
+            if (gp1Aborted && !abortRequested && sessionDeadlineMs > 0
+                    && System.currentTimeMillis() + 60000L < sessionDeadlineMs) {
+                int c1 = countClockStamps(DLMdata);
+                appendLog("BILLING_RETRY_AFTER_ABORT firstRead=" + c1
+                        + " records — healing link and re-reading buffer once");
+                markLinkDirty("BILLING_GP1_ABORTED");
+                gp1Aborted = false;
+                StringBuilder retryDat = this.GetParameter1(port, (byte) 7, "0100620100FF", (byte) 2,
+                        this.bytWait, this.bytTryCnt, this.bytTimOut, true, strbldDLMdata);
+                int c2 = countClockStamps(retryDat);
+                appendLog("BILLING_RETRY_RESULT first=" + c1 + " retry=" + c2 + " records — keeping "
+                        + (c2 > c1 ? "retry" : "first"));
+                if (c2 > c1) DLMdata = retryDat;
+            }
+            if (gp1Aborted)
+                sectionWarnings.add("Billing may be incomplete (transfer aborted)");
             if (hasMeaningfulDlmsPayload(DLMdata))
                 strbldDLMdata.append(DLMdata);
             else {
@@ -9008,6 +9196,15 @@ public class ReadingSDK {
                     }
                 }
                 if (!eventCoMissing) {
+                    // V53: distinguish "meter said no" from "meter said nothing".
+                    // A dirty link means the attr=3 request went unanswered (desync/
+                    // timeout) — concluding "not supported" here would write off an
+                    // event log the meter actually supports.
+                    if (linkDirty) {
+                        appendLog("EVENT_ATTR3_LINKFAIL obis=" + obis
+                                + " — no response (link failure), NOT concluding unsupported");
+                        continue;
+                    }
                     appendLog("EVENT_SKIP obis=" + obis + " attr=3 absent — not supported on this meter");
                     continue;
                 }
@@ -10557,6 +10754,12 @@ public class ReadingSDK {
             // converter knows LP1 was checked. "0100" = DLMS array with 0 elements.
             strbldDLMdata.append("\r\n0007 0100630100FF 02 0100");
             appendLog("RLS_LP_EMPTY_MARKER — entries_in_use=0 and probe found no data; writing empty array to TXT");
+            // V53: an "empty" verdict reached over a broken link is not a verdict —
+            // a desynced window silently returns nothing on every probe.
+            if (linkDirty)
+                sectionWarnings.add("LP empty NOT confirmed (link failures during probes) — re-read advised");
+            else
+                sectionWarnings.add("LP empty (meter reports no interval data)");
         }
 
         return strbldDLMdata;
@@ -10859,6 +11062,7 @@ public class ReadingSDK {
         // Without date filtering the meter returns ALL midnight records (could be 100s of days).
         // Apply the same 35-day cap used for LP so files stay bounded and reads are fast.
         int snapDays = (lsDays > 0) ? lsDays : 35;
+        boolean midnightHandled = false; // V53: true when LS upgrade already appended the buffer
         try {
             Calendar calEnd = Calendar.getInstance();
             calEnd.set(Calendar.HOUR_OF_DAY, 23);
@@ -10920,24 +11124,57 @@ public class ReadingSDK {
             } else if (midnightEiu > 0) {
                 // V38: Secure meters sometimes return last-block=1 in the HDLC DataBlock header
                 // after the first APDU-worth of data, even when the response is incomplete.
-                // GetParameterSelective stops on last-block=1, yielding a partial array.
-                // GetParameter_LS uses HDLC-segmentation reassembly and gets all records.
-                // Detect partial result by counting actual clock-object timestamps (090c)
-                // in the payload and comparing against EIU.
+                // Detect a short result by counting clock-object timestamps (090c).
+                // V53 REWORK (log _15 root cause): EIU counts the WHOLE buffer including
+                // records OUTSIDE the requested window (pre-installation store/factory
+                // days), so selCount < EIU does NOT prove truncation — expected-in-window
+                // is min(EIU, snapDays+1). And NEVER discard decoded records: the old
+                // "DLMdata = null" turned good records into 0 when the LS fallback timed
+                // out on a desynced link. Keep the partial, heal the link, attempt an LS
+                // upgrade, and replace only if LS yields MORE records.
                 String _selHex = _mp.length >= 4 ? _mp[_mp.length - 1].toLowerCase() : "";
                 int selCount = 0;
                 int _si = 0;
                 while ((_si = _selHex.indexOf("090c", _si)) >= 0) { selCount++; _si += 4; }
-                if (selCount < midnightEiu) {
-                    appendLog("MIDNIGHT_SEL_PARTIAL selCount=" + selCount + " < EIU=" + midnightEiu
-                            + " — Secure block-transfer truncated; retrying with full buffer read");
+                int expectedWindow = Math.min(midnightEiu, snapDays + 1);
+                if (selCount == 0) {
+                    appendLog("MIDNIGHT_SEL_ZERO — response decodes no records; falling back to full read");
                     DLMdata = null; // fall through to LS fallback below
+                } else if (selCount < expectedWindow) {
+                    appendLog("MIDNIGHT_SEL_PARTIAL selCount=" + selCount + " < expected=" + expectedWindow
+                            + " (EIU=" + midnightEiu + ", days=" + snapDays
+                            + ") — keeping partial, attempting LS upgrade (V53)");
+                    // A truncated block transfer leaves unread frames → window desync;
+                    // mark dirty so GetParameter_LS heals (SNRM+AARQ) before its request.
+                    markLinkDirty("MIDNIGHT_SEL_TRUNCATED");
+                    StringBuilder upSb = new StringBuilder();
+                    StringBuilder upRes = this.GetParameter_LS(port, (byte) 7, "0100630200FF", (byte) 2,
+                            this.bytWait, this.bytTryCnt, this.bytTimOut, true, upSb);
+                    int upCount = 0;
+                    if (hasMeaningfulDlmsPayload(upRes)) {
+                        String _upHex = upRes.toString().toLowerCase();
+                        int _ui = 0;
+                        while ((_ui = _upHex.indexOf("090c", _ui)) >= 0) { upCount++; _ui += 4; }
+                    }
+                    if (upCount > selCount) {
+                        appendLog("MIDNIGHT_LS_UPGRADE upCount=" + upCount + " > selCount=" + selCount
+                                + " — full read replaces partial selective");
+                        strbldDLMdata.append(upSb);
+                        midnightHandled = true;
+                        DLMdata = null;
+                    } else {
+                        appendLog("MIDNIGHT_KEEP_SEL selCount=" + selCount
+                                + " (LS upgrade gave " + upCount + ") — partial selective retained");
+                        // DLMdata untouched → appended by the normal path below
+                    }
                 } else {
                     appendLog("MIDNIGHT_SEL_COMPLETE selCount=" + selCount);
                 }
             }
         }
-        if (hasMeaningfulDlmsPayload(DLMdata))
+        if (midnightHandled) {
+            // V53: LS upgrade already appended; skip both normal append and SEL_EMPTY fallback.
+        } else if (hasMeaningfulDlmsPayload(DLMdata))
             strbldDLMdata.append(DLMdata);
         else {
             // Fall back to full buffer read if selective access returns empty or was discarded.
@@ -10965,12 +11202,24 @@ public class ReadingSDK {
             }
         }
 
-        // BUG-11 FIX: cross-check EIU vs actual buffer result
-        boolean bufferGotData = hasMeaningfulDlmsPayload(DLMdata);
+        // BUG-11 FIX (V53 rework): cross-check EIU against the records ACTUALLY secured
+        // in the output buffer (count 090c clock stamps), not just the last read's result —
+        // with the keep-partial policy the section can hold data even when the final
+        // fallback read failed.
+        int _mnRec = 0, _mi = 0;
+        String _mnHex = strbldDLMdata.toString().toLowerCase();
+        while ((_mi = _mnHex.indexOf("090c", _mi)) >= 0) { _mnRec++; _mi += 4; }
+        midnightRecCount = _mnRec;
+        midnightEiuSeen  = midnightEiu;
         if (midnightEiu == 0) {
             appendLog("MIDNIGHT_INFO: entries_in_use=0 — buffer confirmed empty");
-        } else if (midnightEiu > 0 && !bufferGotData) {
+        } else if (midnightEiu > 0 && _mnRec == 0) {
             appendLog("MIDNIGHT_CRITICAL: entries_in_use=" + midnightEiu + " but buffer empty — read failure");
+            sectionWarnings.add("Midnight FAILED (meter has " + midnightEiu + " days)");
+        } else if (midnightEiu > 0 && _mnRec < Math.min(midnightEiu, snapDays + 1)) {
+            appendLog("MIDNIGHT_PARTIAL_SECURED records=" + _mnRec
+                    + " expected≈" + Math.min(midnightEiu, snapDays + 1));
+            sectionWarnings.add("Midnight PARTIAL " + _mnRec + "/" + Math.min(midnightEiu, snapDays + 1));
         }
         if (strbldDLMdata.length() == 0) {
             appendLog("MIDNIGHT_WARN: Midnight snapshot all responses empty — skipping section.");
