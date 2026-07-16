@@ -1,3 +1,5 @@
+// VERSION: V54 — SILENCE≠ABSENCE COMPLETION (16-07, from field log _16, SS09084148 Secure + KT067921): V53 verified in the field (21 heal cycles, honest "Done with WARNINGS: Midnight PARTIAL 19/35"; KT067921 LP perfect 36 days/3,444 recs in 4.8 min). Three V53 blind spots closed: (1) MIDNIGHT PAGINATION — Secure firmware IGNORES the selective from-date (log _16 delivered Jun-12..30 against a Jul-2..16 request; midnight EIU=35 = every midnight Jun-12→Jul-16 recorded). After MIDNIGHT_KEEP_SEL, request onward from the newest received record (+1 day 00:00 → today), ≤6 pages, stop on zero-new; pages merged via mergeLpPageHexList into ONE 0100630200FF line (MIDNIGHT_PAGE_REQ/MIDNIGHT_PAGE/MIDNIGHT_PAGED markers). (2) ENTRY-PROBE LINK GUARD — LP_ENTRY_PROBE_TOP/BOTTOM fired mid-GPS-timeout-storm (log _16 11:39:22), read silence, set entryAccessDead → the end-of-LP entry sweep (the ONE path that bypasses Secure's broken time-range engine and would have recovered Jul-10..15) was skipped (LP_ENTRY_FALLBACK_SKIP). Now: relinkIfDirty before probes; probe silence with linkDirty/heals during probes → LP_ENTRY_PROBE_LINKFAIL, entry access stays available. entryAccessDead only from confirmed-empty probes on a clean link. (3) DAY-LOOP LINK RETRY — a NO_DATA day whose request needed healing (timeout→heal→empty) is redone once on the healed link before counting toward the 2-day early-stop (RLS_SEL_DAY_LINKRETRY, ≤4/session). Meter verdicts only from clean-link answers. NO CHANGE to MAX_LP_DAYS=35 (deliberate session cap; Secure SS meters retain 90 days — missed days stay recoverable ~3 months via the entry sweep).
+// VERSION: V53 — LINK-STATE MANAGER: SELF-HEALING HDLC + NEVER-DISCARD-DATA (15-07, from field log _15, SS09084148 Secure + KT326986 L&T): ROOT CAUSE — incomplete billing/LP/midnight ← every read after a truncated transfer returns silence/empty ← the meter IGNORES I-frames whose N(S)/N(R) don't match its window ← FrameType() INFERS the counters from received frames, so any transfer cut short (block abort, RR-loop break, deadline, timeout) leaves unread frames and desyncs the window ← nothing ever re-synced it. Gurux model: sequence state is only trustworthy after SNRM resets both sides; after a failed exchange, re-associate before reusing the link. (1) LINK-STATE MANAGER — linkDirty is set at EVERY abnormal transaction exit (all *_ABORT/_BREAK/_DEADLINE/_NO_RESPONSE/CONT_FAIL/ERROR_FRAME exits in GetParameter/GetParameter1/GetParameterSelective/GetParameter_LS); healLink() = AddressInit+SNRM+AARQ+drain (~1.5s); relinkIfDirty() guards ENTRY of all four transaction functions; in-loop: a silent first attempt heals + refreshRequestSequence() rewrites the pending frame's control byte + both FCS from the fresh counters. (2) MIDNIGHT NEVER-DISCARD — the old partial detector compared records-in-window vs EIU (whole buffer incl. pre-installation days) → false PARTIAL → discarded GOOD records → LS fallback timed out on the desynced link → 0 records + "Midnight OK". Now: expected=min(EIU, days+1); keep the selective result ALWAYS when it decodes records; LS runs as an UPGRADE on a healed link and replaces only if it yields MORE records; honest status Midnight OK/PARTIAL n/m/FAILED. (3) BILLING RETRY AFTER ABORT — GP1 block-transfer abort loses the newest billing records; now heals the link and re-reads the buffer once, keeping whichever result has more records; "Billing may be incomplete" warning if still aborted. (4) HONEST VERDICTS — "attr=3 absent → not supported" is only concluded on a CLEAN link; LP "confirmed empty" gets a re-read-advised warning when probes ran on a dirty link; session end says "Done with WARNINGS: …" + operator WARN instead of a false "All data OK".
 // VERSION: V52 — OPERATOR FEEDBACK + BILLING PING-PONG BOUND (14-07, from field log _14): (1) LIVE TRANSFER HEARTBEAT — billing/scaler/capture-object pulls run in GetParameter/GetParameter1 which never ticked progress; 14-07 session 1 billing crawled 320s on a weak optical coupling with no signal and the operator aborted a progressing read. New xferHeartbeat() logs progress every 3s (blocks · kB · elapsed) and flags 'SLOW LINK — hold coupler steady' after 45s on one object (no phase-dashboard UI in this SDK class, so this is a log-only heartbeat; the host app's phase dashboard equivalent lives in Reading.java). (2) GP BLOCK-LOOP BOUND — GetParameter's while(flag1) block pull had abortRequested as its ONLY exit: on a marginal link the meter answers every resend with a supervisory frame (each resets the retry counter, so no timeout can ever fire) → silent infinite ping-pong (320s, strbldLen=23013 of duplicates for a 6701-char object). Now: 120s/200-cycle budget (GP_BLOCK_BUDGET_ABORT) + 6-consecutive-supervisory-frames breaker (GP_RR_LOOP_BREAK); partial returned, caller's GP1 fallback still runs. GP1 already had 90s billingDeadline+consec-fail bounds — only heartbeat added. (3) SEL_ENTRY_FRAME FIX — String.format("%02X", byte) throws IllegalFormatConversionException (boxed Byte), silently caught since V50, which is why the dump appeared in NO field log; now masks to int. (4) LP_ENTRY_FALLBACK_SKIP — when both entry probes decode to zero records, the end-of-LP entry sweep (same frame, same fate, 16s/page) is skipped: 14-07 KT280549 burned 128s on probes+sweep for nothing. FIELD FACTS from log _14: billing 14-Jul-13:47:04 record absent because the MD reset raced the read (billing buffer pulled 13:46:58-13:47:20, reset stamped 13:47:04 — re-read gets it); post-reset the meter serves LP only back to ~Jul 5 10:45 (886 recs ≈ attr7=990) — Jun 8-19 mornings no longer retrievable optically.
 // VERSION: V51 — GPLS MULTI-BLOCK RESEND FIX + SECURE PROPRIETARY CURRENTS (13-07, from field log _13): (1) GPLS SELECTIVE BLOCK LOOP: the send do-while only exited after nTryCount timeouts — a SUCCESSFUL multi-block receive (flag3=true, num196=0) looped back and resent GetRequest(next) for the same block forever; KT280549 day -24 (Jun 19) answered in 2 blocks and the session sat silently 12:31:21→12:39:26 deadline (GPLS_SEL_BLOCK_ABORT block=1), losing the 8 minutes that would have re-read Jun 8-19 (those days remain 54/96 in DB from pre-V50 reads — a V51 re-read will fill them). Condition now 'while (!flag3 && …)' matching the sibling receive loop. Secure selective LP normally fits one 19-record block so this path never fired before. (2) SECURE ACTIVE/REACTIVE CURRENT (user-confirmed Secure-proprietary OBIS): instant read now requests active 1.0.161/163/165.7.0.255 and reactive 1.0.162/164/166.7.0.255 (alt family 1.0.37/57/77.7.0.255 when primary silent) on Secure only, first-OBIS probe with single try, attr=3 per register — the EDIS instant screen rows P2-2-x/P2-3-x were blank because the app never requested these. V50 field-verified in log _13: 96/96 per day (ladder fix), V=247-249/I incl. L1 correctly scaled via meter attr=3, SCALER_MISSING logs only on non-register objects. NOTE: log _13's APK is an INTERMEDIATE V50 build — SEL_ENTRY_FRAME dump and bottom-probe skip are missing from it; compile THIS file so the L&T selector-2 frame bytes finally get captured.
 // VERSION: V50 — METER-ONLY SCALERS + NEWEST-FIRST LADDER FIX (10-07, from V49 field logs _9/_10/_12 and KT280549 wrong V/I): FIELD RULE — every scaler must be COLLECTED from the meter, never derived or hardcoded. (1) appendMissingScalerLines no longer fabricates IS15959-2 table defaults into the TXT (KT280549 got '0007 01001F0700FF 03 02020FFD1621' sc=-3 fabricated while its true current scaler is -6 = 1000× error; only TOD T1-T8 inheriting the meter's OWN T0 scaler is kept; otherwise SCALER_MISSING + raw value). (2) ReadScalarUnit refactored: compound 5E5B03/04/05/06/07FF attr=3 retried once on a drained line when attr=2 answered but attr=3 didn't (KT280549 lost 5E5B03FF attr=3 → converter had scaler VALUES with no column list → V=24751610 raw in XML/DB instead of 247.52). (3) needIndivScalers now TRUE for all makes (OPT-4 reverted) + SCALER ATTR3 COMPLETENESS SWEEP at end of ReadInstantData: any '0003 <obis> 02' without matching attr=3 is re-requested once (both Secure TXTs show the FIRST attr=3 of the phase — 01001F0700FF — systematically dropped). (4) lpFillDayGaps: a page that ADDS records clears gapAttempts for the gap — newest-first makes (KT280549: 19 rec/page from range tail, gapStart fixed at 00:00) burned all 3 attempts on successful pages and closed every day at 54/96 (mornings 00:00-10:30 lost, confirmed in DB).
@@ -10021,6 +10023,11 @@ public class ReadingSDK {
         boolean entryAccessDead = false;
         if (!abortRequested && !lpShouldAbort()) {
             try {
+                // V54: probes fired during a link storm (log _16: LP_ENTRY_PROBE_TOP at
+                // the exact moment of GPS_NO_RESPONSE) learn nothing about the METER —
+                // heal first, and never mark entry access dead from a dirty-link probe.
+                relinkIfDirty(port, "LP-probes");
+                int probeHealsBefore = linkHealCount;
                 StringBuilder pTop = lpGetByEntry(port, Math.max(1, probeTopEntry - 2), probeTopEntry, capturePeriodMin);
                 String pTopHex = (pTop == null) ? "" : pTop.toString().trim();
                 TreeSet<Long> topSlots = new TreeSet<>();
@@ -10034,8 +10041,15 @@ public class ReadingSDK {
                 // selector-2 frame at HDLC level — the BOTTOM probe would only burn
                 // another timeout. The SEL_ENTRY_FRAME dump is what we need instead.
                 if (pTopHex.isEmpty()) {
-                    appendLog("LP_ENTRY_PROBE_SKIP_BOTTOM — no response to TOP, frame dump logged");
-                    entryAccessDead = true;
+                    if (linkDirty || linkHealCount > probeHealsBefore) {
+                        // V54: silence caused by a link failure (not the meter refusing
+                        // the frame) — keep entry access available for the end-of-LP sweep.
+                        appendLog("LP_ENTRY_PROBE_LINKFAIL heals=" + (linkHealCount - probeHealsBefore)
+                                + " dirty=" + linkDirty + " — NOT marking entry access dead (V54)");
+                    } else {
+                        appendLog("LP_ENTRY_PROBE_SKIP_BOTTOM — no response to TOP, frame dump logged");
+                        entryAccessDead = true;
+                    }
                 } else {
                     StringBuilder pBot = lpGetByEntry(port, 1, 3, capturePeriodMin);
                     String pBotHex = (pBot == null) ? "" : pBot.toString().trim();
@@ -10048,7 +10062,14 @@ public class ReadingSDK {
                     // → selector-2 answers carry no data on this meter; sweep is futile.
                     TreeSet<Long> topSlots2 = new TreeSet<>();
                     collectLpTimestamps(pTopHex, topSlots2);
-                    if (topSlots2.isEmpty() && botSlots.isEmpty()) entryAccessDead = true;
+                    if (topSlots2.isEmpty() && botSlots.isEmpty()) {
+                        if (linkDirty || linkHealCount > probeHealsBefore) {
+                            appendLog("LP_ENTRY_PROBE_LINKFAIL heals=" + (linkHealCount - probeHealsBefore)
+                                    + " dirty=" + linkDirty + " — NOT marking entry access dead (V54)");
+                        } else {
+                            entryAccessDead = true;
+                        }
+                    }
                 }
             } catch (Exception probeEx) {
                 appendLog("LP_ENTRY_PROBE_EX: " + probeEx.getMessage());
@@ -10408,9 +10429,11 @@ public class ReadingSDK {
                 boolean stalledReconnectDone = false; // V37: one reconnect attempt per LP read
                 int consecutiveEmptyDays = 0;         // V37: track consecutive NO_DATA days
                 int daySelDesyncs = 0;                // V49: max 6 DAY-SEL stale-response recoveries
+                int dayLinkRetries = 0;               // V54: max 4 heal-then-redo of NO_DATA days
                 // V38: Read newest-first (i=0=today → i=lsDays=oldest) so recent data is
                 // captured before any HDLC stall on older days cuts the session short.
                 for (int i = 0; i <= lsDays; i++) {
+                    int dayHealsBefore = linkHealCount; // V54
                     if (abortRequested) {
                         appendLog("RLS_SEL_ABORT at day=" + i);
                         break;
@@ -10608,6 +10631,19 @@ public class ReadingSDK {
                         appendLog("LP Day " + (i + 1) + "/" + (lsDays + 1)
                                 + " | " + totalActualRecords + " of ~" + targetRecords + " records received");
                     } else {
+                        // V54: a NO_DATA day whose request needed link healing is a link
+                        // verdict, not a meter verdict (log _16: every Jul-12..15 day
+                        // request timed out, healed, then read empty) — redo the day once
+                        // on the healed link before counting it toward the early-stop.
+                        if (linkHealCount > dayHealsBefore && dayLinkRetries < 4
+                                && !abortRequested && !lpShouldAbort()) {
+                            dayLinkRetries++;
+                            appendLog("RLS_SEL_DAY_LINKRETRY day=-" + i
+                                    + " heals=" + (linkHealCount - dayHealsBefore)
+                                    + " retry=" + dayLinkRetries + "/4 (V54)");
+                            i--; // redo this day
+                            continue;
+                        }
                         consecutiveEmptyDays++;
                         appendLog("RLS_SEL_DAY day=-" + i + " NO_DATA consecutiveEmpty=" + consecutiveEmptyDays);
                         if (consecutiveEmptyDays >= 2 && i > 3) {
@@ -11165,7 +11201,65 @@ public class ReadingSDK {
                     } else {
                         appendLog("MIDNIGHT_KEEP_SEL selCount=" + selCount
                                 + " (LS upgrade gave " + upCount + ") — partial selective retained");
-                        // DLMdata untouched → appended by the normal path below
+                        // ── V54 MIDNIGHT PAGINATION (log _16 root cause) ──────────────
+                        // Secure firmware ignores the selective from-date and answers the
+                        // buffer OLDEST-first, truncated ~19 records/transfer — one request
+                        // can never reach recent dates. Request onward from the newest
+                        // received record, page by page, and merge before appending.
+                        try {
+                            TreeSet<Long> mnStamps = new TreeSet<>();
+                            collectLpTimestampsLoose(_selHex, mnStamps);
+                            if (!mnStamps.isEmpty()) {
+                                List<String> mnPages = new ArrayList<>();
+                                mnPages.add(_selHex);
+                                int mnTotal = selCount;
+                                int mnPageN = 0;
+                                while (mnTotal < expectedWindow && mnPageN < 6 && !abortRequested) {
+                                    Calendar pgFrom = Calendar.getInstance();
+                                    pgFrom.setTimeInMillis(mnStamps.last());
+                                    pgFrom.add(Calendar.DAY_OF_YEAR, 1);
+                                    pgFrom.set(Calendar.HOUR_OF_DAY, 0);
+                                    pgFrom.set(Calendar.MINUTE, 0);
+                                    pgFrom.set(Calendar.SECOND, 0);
+                                    pgFrom.set(Calendar.MILLISECOND, 0);
+                                    if (pgFrom.getTimeInMillis() > System.currentTimeMillis()) break; // reached today
+                                    Calendar pgTo = Calendar.getInstance();
+                                    pgTo.set(Calendar.HOUR_OF_DAY, 23);
+                                    pgTo.set(Calendar.MINUTE, 59);
+                                    pgTo.set(Calendar.SECOND, 59);
+                                    mnPageN++;
+                                    appendLog("MIDNIGHT_PAGE_REQ page=" + mnPageN + " from=" + pgFrom.getTime()
+                                            + " have=" + mnTotal + "/" + expectedWindow + " (V54)");
+                                    StringBuilder pgRes = this.GetParameterSelective(port, (byte) 7,
+                                            "0100630200FF", (byte) 2,
+                                            this.bytWait, this.bytTryCnt, this.bytTimOut, false,
+                                            pgFrom.getTime(), pgTo.getTime(), 1440);
+                                    String pgHex = (pgRes == null) ? "" : pgRes.toString().trim();
+                                    TreeSet<Long> pgStamps = new TreeSet<>();
+                                    if (!pgHex.isEmpty()) collectLpTimestampsLoose(pgHex, pgStamps);
+                                    int pgNew = 0;
+                                    for (Long t : pgStamps) if (!mnStamps.contains(t)) pgNew++;
+                                    appendLog("MIDNIGHT_PAGE page=" + mnPageN + " records=" + pgStamps.size()
+                                            + " new=" + pgNew);
+                                    if (pgNew == 0) break; // empty, duplicate or link-dead — stop
+                                    mnPages.add(pgHex);
+                                    mnStamps.addAll(pgStamps);
+                                    mnTotal += pgNew;
+                                }
+                                if (mnPages.size() > 1) {
+                                    String mnMerged = mergeLpPageHexList(mnPages);
+                                    if (mnMerged != null && !mnMerged.isEmpty()) {
+                                        appendLog("MIDNIGHT_PAGED total=" + mnTotal + "/" + expectedWindow
+                                                + " pages=" + mnPages.size() + " — merged (V54)");
+                                        DLMdata = new StringBuilder("\r\n0007 0100630200FF 02 " + mnMerged);
+                                        selCount = mnTotal;
+                                    }
+                                }
+                            }
+                        } catch (Exception mnPgEx) {
+                            appendLog("MIDNIGHT_PAGE_EX: " + mnPgEx.getMessage() + " — partial retained");
+                        }
+                        // DLMdata (original or merged) → appended by the normal path below
                     }
                 } else {
                     appendLog("MIDNIGHT_SEL_COMPLETE selCount=" + selCount);
