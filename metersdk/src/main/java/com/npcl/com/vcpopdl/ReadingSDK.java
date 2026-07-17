@@ -10678,9 +10678,6 @@ public class ReadingSDK {
                                         + " dayTotal=" + gdSlots.size() + " (V55)");
                                 appendLog("LP Day " + (i + 1) + "/" + (lsDays + 1)
                                         + " | " + totalActualRecords + " of ~" + targetRecords + " records received");
-                                fireProgress(activeCallback, "Load Profile day " + (i + 1) + "/" + (lsDays + 1)
-                                        + " — " + totalActualRecords + " of ~" + targetRecords + " records",
-                                        62 + (30 * (i + 1)) / (lsDays + 1));
                                 continue;
                             }
                             appendLog("RLS_SEL_DAY_GAPDRIVE day=-" + i + " added=0");
