@@ -1,3 +1,4 @@
+// VERSION: V55 — GAP-ENGINE AS THE RETRY PATH (17-07, from field log _17, SS09084148 Secure): V54 verified — midnight SOLVED (pagination 35/35, DB has Jul-2..16 kWh values), probe guard + day retry worked (Jul-15 answered on attempt 5 → gap-filled 96/96 in 8×0.7s pages). Midnight kWh deltas Jul-11..15 = 97-104/day (normal consumption) PROVE Jul-12/13/14 LP exists — every "NO_DATA" was an ignored request. Key pattern: requests with a POSITIVE-length window (gap pages, midnight pages) answered ~0.7s; the flaky ones are DAY requests (from=to=00:00, zero-length window). Four fixes: (1) GAP-DRIVE — a silent day is retried by driving lpFillDayGaps with empty coverage (positive-window pagination, the proven shape) instead of re-sending the day request; ≤10 days/session (RLS_SEL_DAY_GAPDRIVE / GAPDRIVE_OK). Replaces V54's naked RLS_SEL_DAY_LINKRETRY whose global 4-retry budget was burned entirely on day -1, leaving Jul-12/13/14 with zero retries. (2) GAP LADDER HEAL-AWARENESS — a page whose request needed an in-flight heal can never mark a range dead "confirmed" (log _17: Jul-11 16:45+ confirmed-dead after two heal-then-fast-empty pages that slipped past the lastSelHadResponse timeout guard) and gets one extra try on the healed link (RLS_GAP_LINKRETRY, ≤4/day; gapSawTimeout set on any healed page). (3) EARLY-STOP threshold 2→4 consecutive empty days when linkHealCount>0 (ignored requests masquerade as empty days); clean links keep 2. (4) ENTRY SWEEP fast-abort — probes silent AND sweep pages silent → stop after 2 pages, not 6 (selector-2 CONFIRMED never answering on SS-type Secure: probes + 6 sweep pages all silent on healed link = ~100s wasted in log _17).
 // VERSION: V54 — SILENCE≠ABSENCE COMPLETION (16-07, from field log _16, SS09084148 Secure + KT067921): V53 verified in the field (21 heal cycles, honest "Done with WARNINGS: Midnight PARTIAL 19/35"; KT067921 LP perfect 36 days/3,444 recs in 4.8 min). Three V53 blind spots closed: (1) MIDNIGHT PAGINATION — Secure firmware IGNORES the selective from-date (log _16 delivered Jun-12..30 against a Jul-2..16 request; midnight EIU=35 = every midnight Jun-12→Jul-16 recorded). After MIDNIGHT_KEEP_SEL, request onward from the newest received record (+1 day 00:00 → today), ≤6 pages, stop on zero-new; pages merged via mergeLpPageHexList into ONE 0100630200FF line (MIDNIGHT_PAGE_REQ/MIDNIGHT_PAGE/MIDNIGHT_PAGED markers). (2) ENTRY-PROBE LINK GUARD — LP_ENTRY_PROBE_TOP/BOTTOM fired mid-GPS-timeout-storm (log _16 11:39:22), read silence, set entryAccessDead → the end-of-LP entry sweep (the ONE path that bypasses Secure's broken time-range engine and would have recovered Jul-10..15) was skipped (LP_ENTRY_FALLBACK_SKIP). Now: relinkIfDirty before probes; probe silence with linkDirty/heals during probes → LP_ENTRY_PROBE_LINKFAIL, entry access stays available. entryAccessDead only from confirmed-empty probes on a clean link. (3) DAY-LOOP LINK RETRY — a NO_DATA day whose request needed healing (timeout→heal→empty) is redone once on the healed link before counting toward the 2-day early-stop (RLS_SEL_DAY_LINKRETRY, ≤4/session). Meter verdicts only from clean-link answers. NO CHANGE to MAX_LP_DAYS=35 (deliberate session cap; Secure SS meters retain 90 days — missed days stay recoverable ~3 months via the entry sweep).
 // VERSION: V53 — LINK-STATE MANAGER: SELF-HEALING HDLC + NEVER-DISCARD-DATA (15-07, from field log _15, SS09084148 Secure + KT326986 L&T): ROOT CAUSE — incomplete billing/LP/midnight ← every read after a truncated transfer returns silence/empty ← the meter IGNORES I-frames whose N(S)/N(R) don't match its window ← FrameType() INFERS the counters from received frames, so any transfer cut short (block abort, RR-loop break, deadline, timeout) leaves unread frames and desyncs the window ← nothing ever re-synced it. Gurux model: sequence state is only trustworthy after SNRM resets both sides; after a failed exchange, re-associate before reusing the link. (1) LINK-STATE MANAGER — linkDirty is set at EVERY abnormal transaction exit (all *_ABORT/_BREAK/_DEADLINE/_NO_RESPONSE/CONT_FAIL/ERROR_FRAME exits in GetParameter/GetParameter1/GetParameterSelective/GetParameter_LS); healLink() = AddressInit+SNRM+AARQ+drain (~1.5s); relinkIfDirty() guards ENTRY of all four transaction functions; in-loop: a silent first attempt heals + refreshRequestSequence() rewrites the pending frame's control byte + both FCS from the fresh counters. (2) MIDNIGHT NEVER-DISCARD — the old partial detector compared records-in-window vs EIU (whole buffer incl. pre-installation days) → false PARTIAL → discarded GOOD records → LS fallback timed out on the desynced link → 0 records + "Midnight OK". Now: expected=min(EIU, days+1); keep the selective result ALWAYS when it decodes records; LS runs as an UPGRADE on a healed link and replaces only if it yields MORE records; honest status Midnight OK/PARTIAL n/m/FAILED. (3) BILLING RETRY AFTER ABORT — GP1 block-transfer abort loses the newest billing records; now heals the link and re-reads the buffer once, keeping whichever result has more records; "Billing may be incomplete" warning if still aborted. (4) HONEST VERDICTS — "attr=3 absent → not supported" is only concluded on a CLEAN link; LP "confirmed empty" gets a re-read-advised warning when probes ran on a dirty link; session end says "Done with WARNINGS: …" + operator WARN instead of a false "All data OK".
 // VERSION: V52 — OPERATOR FEEDBACK + BILLING PING-PONG BOUND (14-07, from field log _14): (1) LIVE TRANSFER HEARTBEAT — billing/scaler/capture-object pulls run in GetParameter/GetParameter1 which never ticked progress; 14-07 session 1 billing crawled 320s on a weak optical coupling with no signal and the operator aborted a progressing read. New xferHeartbeat() logs progress every 3s (blocks · kB · elapsed) and flags 'SLOW LINK — hold coupler steady' after 45s on one object (no phase-dashboard UI in this SDK class, so this is a log-only heartbeat; the host app's phase dashboard equivalent lives in Reading.java). (2) GP BLOCK-LOOP BOUND — GetParameter's while(flag1) block pull had abortRequested as its ONLY exit: on a marginal link the meter answers every resend with a supervisory frame (each resets the retry counter, so no timeout can ever fire) → silent infinite ping-pong (320s, strbldLen=23013 of duplicates for a 6701-char object). Now: 120s/200-cycle budget (GP_BLOCK_BUDGET_ABORT) + 6-consecutive-supervisory-frames breaker (GP_RR_LOOP_BREAK); partial returned, caller's GP1 fallback still runs. GP1 already had 90s billingDeadline+consec-fail bounds — only heartbeat added. (3) SEL_ENTRY_FRAME FIX — String.format("%02X", byte) throws IllegalFormatConversionException (boxed Byte), silently caught since V50, which is why the dump appeared in NO field log; now masks to int. (4) LP_ENTRY_FALLBACK_SKIP — when both entry probes decode to zero records, the end-of-LP entry sweep (same frame, same fate, 16s/page) is skipped: 14-07 KT280549 burned 128s on probes+sweep for nothing. FIELD FACTS from log _14: billing 14-Jul-13:47:04 record absent because the MD reset raced the read (billing buffer pulled 13:46:58-13:47:20, reset stamped 13:47:04 — re-read gets it); post-reset the meter serves LP only back to ~Jul 5 10:45 (886 recs ≈ attr7=990) — Jun 8-19 mornings no longer retrievable optically.
@@ -8390,6 +8391,7 @@ public class ReadingSDK {
         // V45: per-gap attempt counter; gapSawTimeout tracks gaps where meter never responded
         HashMap<Long, Integer> gapAttempts = new HashMap<>();
         int desyncRetries = 0; // V47: max 4 stale-response drain+retry recoveries per day
+        int gapHealRetries = 0; // V55: max 4 extra tries for pages whose request needed a heal
         HashSet<Long> gapSawTimeout = new HashSet<>();
         while (pages < MAX_GAP_PAGES) {
             if (abortRequested || lpShouldAbort()) {
@@ -8451,6 +8453,7 @@ public class ReadingSDK {
             appendLog("RLS_GAP_REQ day=-" + dayIndex + " page=" + (pages + 1) + " attempt=" + attempt
                     + " from=" + new Date(reqStart) + " to=" + new Date(reqEnd));
             StringBuilder resp;
+            int pageHealsBefore = linkHealCount; // V55
             try {
                 selEndTimeOverride = new Date(reqEnd);
                 resp = GetParameterSelective(port, (byte) 7, "0100630100FF", (byte) 2,
@@ -8460,6 +8463,13 @@ public class ReadingSDK {
                 selEndTimeOverride = null;
             }
             pages++;
+            // V55: log _17 day -5 — the resend after an in-request heal was answered
+            // FAST with an empty frame, so lastSelHadResponse=true slipped past the
+            // timeout guard and Jul-11 16:45+ was marked dead "confirmed=true" while
+            // the midnight kWh delta proves the data exists. Any page whose request
+            // needed healing can never confirm a range empty.
+            boolean pageHadHeals = linkHealCount > pageHealsBefore;
+            if (pageHadHeals) gapSawTimeout.add(gapStart);
             if (!lastSelHadResponse) {
                 gapSawTimeout.add(gapStart);
                 // V46: a no-response gap request can leave a pending segmented reply
@@ -8563,6 +8573,16 @@ public class ReadingSDK {
                     appendLog("RLS_GAP_KNOWN_ONLY day=-" + dayIndex + " page=" + pages + " attempt=" + attempt
                             + " — all timestamps already seen, escalating");
                 }
+            }
+            if (!accepted && pageHadHeals && gapHealRetries < 4) {
+                // V55: the failed page rode a freshly-healed link — retry the same gap
+                // once more without consuming a ladder attempt.
+                gapHealRetries++;
+                gapAttempts.put(gapStart, attempt - 1); // attempt not consumed
+                appendLog("RLS_GAP_LINKRETRY day=-" + dayIndex + " page=" + pages
+                        + " heals=" + (linkHealCount - pageHealsBefore)
+                        + " retry=" + gapHealRetries + "/4 (V55)");
+                continue;
             }
             if (!accepted) {
                 appendLog("RLS_GAP_EMPTY day=-" + dayIndex + " page=" + pages + " attempt=" + attempt
@@ -10021,6 +10041,7 @@ public class ReadingSDK {
         // exact same lpGetByEntry frame and will fail identically, at 16s per
         // page (14-07 KT280549: 2×16s probes + 6×16s sweep = 128s for nothing).
         boolean entryAccessDead = false;
+        boolean lpProbesSilent = false; // V55: both probes decoded 0 records (any link state)
         if (!abortRequested && !lpShouldAbort()) {
             try {
                 // V54: probes fired during a link storm (log _16: LP_ENTRY_PROBE_TOP at
@@ -10041,6 +10062,7 @@ public class ReadingSDK {
                 // selector-2 frame at HDLC level — the BOTTOM probe would only burn
                 // another timeout. The SEL_ENTRY_FRAME dump is what we need instead.
                 if (pTopHex.isEmpty()) {
+                    lpProbesSilent = true; // V55
                     if (linkDirty || linkHealCount > probeHealsBefore) {
                         // V54: silence caused by a link failure (not the meter refusing
                         // the frame) — keep entry access available for the end-of-LP sweep.
@@ -10063,6 +10085,7 @@ public class ReadingSDK {
                     TreeSet<Long> topSlots2 = new TreeSet<>();
                     collectLpTimestamps(pTopHex, topSlots2);
                     if (topSlots2.isEmpty() && botSlots.isEmpty()) {
+                        lpProbesSilent = true; // V55
                         if (linkDirty || linkHealCount > probeHealsBefore) {
                             appendLog("LP_ENTRY_PROBE_LINKFAIL heals=" + (linkHealCount - probeHealsBefore)
                                     + " dirty=" + linkDirty + " — NOT marking entry access dead (V54)");
@@ -10429,11 +10452,10 @@ public class ReadingSDK {
                 boolean stalledReconnectDone = false; // V37: one reconnect attempt per LP read
                 int consecutiveEmptyDays = 0;         // V37: track consecutive NO_DATA days
                 int daySelDesyncs = 0;                // V49: max 6 DAY-SEL stale-response recoveries
-                int dayLinkRetries = 0;               // V54: max 4 heal-then-redo of NO_DATA days
+                int gapDriveDays = 0;                 // V55: max 10 gap-engine drives of silent days
                 // V38: Read newest-first (i=0=today → i=lsDays=oldest) so recent data is
                 // captured before any HDLC stall on older days cuts the session short.
                 for (int i = 0; i <= lsDays; i++) {
-                    int dayHealsBefore = linkHealCount; // V54
                     if (abortRequested) {
                         appendLog("RLS_SEL_ABORT at day=" + i);
                         break;
@@ -10498,10 +10520,14 @@ public class ReadingSDK {
 
                         // Filter: keep payload only if it appears to contain actual LP rows.
                         if (!hasLoadProfileRecords(lpHex)) {
+                            // V55: on a link that needed healing this session, "empty" days
+                            // are often ignored requests (log _17: Jul-12/13/14 read empty
+                            // while midnight kWh deltas prove ~96 recs/day exist) — require
+                            // 4 consecutive before stopping; clean links keep the fast 2.
                             consecutiveEmptyDays++;
                             appendLog("RLS_SEL_DAY day=-" + i + " EMPTY_SKIPPED len=" + lpHex.length()
                                     + " consecutiveEmpty=" + consecutiveEmptyDays);
-                            if (consecutiveEmptyDays >= 2 && i > 3) {
+                            if (consecutiveEmptyDays >= ((linkHealCount > 0) ? 4 : 2) && i > 3) { // V55: link-suspect threshold
                                 // V46: consecutive empty-array days can be a jammed link from
                                 // a previous NO-RESPONSE gap request — try one reconnect first.
                                 if (!stalledReconnectDone && !abortRequested) {
@@ -10631,22 +10657,37 @@ public class ReadingSDK {
                         appendLog("LP Day " + (i + 1) + "/" + (lsDays + 1)
                                 + " | " + totalActualRecords + " of ~" + targetRecords + " records received");
                     } else {
-                        // V54: a NO_DATA day whose request needed link healing is a link
-                        // verdict, not a meter verdict (log _16: every Jul-12..15 day
-                        // request timed out, healed, then read empty) — redo the day once
-                        // on the healed link before counting it toward the early-stop.
-                        if (linkHealCount > dayHealsBefore && dayLinkRetries < 4
-                                && !abortRequested && !lpShouldAbort()) {
-                            dayLinkRetries++;
-                            appendLog("RLS_SEL_DAY_LINKRETRY day=-" + i
-                                    + " heals=" + (linkHealCount - dayHealsBefore)
-                                    + " retry=" + dayLinkRetries + "/4 (V54)");
-                            i--; // redo this day
-                            continue;
+                        // V55 GAP-DRIVE (replaces V54's naked re-request): the DAY request is
+                        // a zero-length window (from=to=00:00) this firmware often ignores,
+                        // while gap-style positive-length windows answered in ~0.7s all
+                        // through log _17 — day -1 (Jul-15) went silent 4× as a day request,
+                        // then gap-filled 96/96 in 8 fast pages. On silence, drive the gap
+                        // engine over the whole day instead of re-sending the day request.
+                        if (gapDriveDays < 10 && !abortRequested && !lpShouldAbort()) {
+                            gapDriveDays++;
+                            appendLog("RLS_SEL_DAY_GAPDRIVE day=-" + i
+                                    + " drive=" + gapDriveDays + "/10 (V55)");
+                            TreeSet<Long> gdSlots = new TreeSet<>();
+                            int gdAdded = lpFillDayGaps(port, dayDate, capturePeriodMin,
+                                    gdSlots, lpPageHexList, seenPayloads, i);
+                            if (gdAdded > 0) {
+                                totalActualRecords += gdAdded;
+                                selectiveOk++;
+                                consecutiveEmptyDays = 0;
+                                appendLog("RLS_SEL_DAY day=-" + i + " GAPDRIVE_OK records=" + gdAdded
+                                        + " dayTotal=" + gdSlots.size() + " (V55)");
+                                appendLog("LP Day " + (i + 1) + "/" + (lsDays + 1)
+                                        + " | " + totalActualRecords + " of ~" + targetRecords + " records received");
+                                fireProgress(activeCallback, "Load Profile day " + (i + 1) + "/" + (lsDays + 1)
+                                        + " — " + totalActualRecords + " of ~" + targetRecords + " records",
+                                        62 + (30 * (i + 1)) / (lsDays + 1));
+                                continue;
+                            }
+                            appendLog("RLS_SEL_DAY_GAPDRIVE day=-" + i + " added=0");
                         }
                         consecutiveEmptyDays++;
                         appendLog("RLS_SEL_DAY day=-" + i + " NO_DATA consecutiveEmpty=" + consecutiveEmptyDays);
-                        if (consecutiveEmptyDays >= 2 && i > 3) {
+                        if (consecutiveEmptyDays >= ((linkHealCount > 0) ? 4 : 2) && i > 3) { // V55: link-suspect threshold
                             // V37: HDLC stall recovery — after 2+ consecutive empty days the meter's
                             // HDLC state is likely corrupted by a partial-stall mid-block-transfer.
                             // drainPort() cleared the Android USB FIFO but the meter still has
@@ -10742,7 +10783,10 @@ public class ReadingSDK {
                             lpAuditPage("ENTRY " + lo + ".." + hi, eh);
                         } else {
                             entryEmpty++;
-                            int emptyLimit = (entryAdded == 0) ? 6 : 2;
+                            // V55: probes silent AND sweep silent = zero evidence entry
+                            // access has EVER answered on this meter (log _17: 6×17s
+                            // wasted on SS-type Secure) — give up after 2 pages.
+                            int emptyLimit = (entryAdded == 0) ? (lpProbesSilent ? 2 : 6) : 2;
                             if (entryEmpty >= emptyLimit) {
                                 appendLog("LP_ENTRY_STOP consecutive empty/known pages=" + entryEmpty);
                                 break;
