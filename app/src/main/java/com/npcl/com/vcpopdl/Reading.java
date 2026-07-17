@@ -1,3 +1,16 @@
+// VERSION: V56 — MANGLED-HEAD REPAIR (17-07, from field log _18 "onDemand1", SS09084148 Secure): V55 verified — gap-drive recovered 7 full days
+// (Jul 7-10, 12-14, ~672 recs) in one 10.5-min read; no false confirmed-dead; entry sweep stopped at 2 pages. ONE systematic gap remained: the 22:00
+// IST interval missing on EVERY optical-read day (DB stores UTC — "16:30" rows = 22:00 IST) while MRI-read days hold the full 96. ROOT CAUSE: the last
+// evening page (req 22:00→midnight) always arrives with its first 3 bytes eaten (3-byte-strip class) — array tag, count and the first record's struct
+// tag '02' — payload starts "<fieldcount>090c07e…" (log: "0b090c07ea070e02", LP_PAGE_AUDIT declared=-1). The strict collector rightly skips the mangled
+// record and mergeLpPageHexList drops it (ROW_FALLBACK recStart=88); dayTotal still reads 96 because the next-midnight record fills the count; the
+// ladder re-requested exactly 22:00→22:15 (page 11) but the answer came back mangled the same way and RLS_GAP_IMPLICIT closed the range (V49's
+// DESYNC_MANGLED guard only fires on stamps PREDATING reqFrom; these are in-range). Retrying can never fix a deterministic mangle — repair can:
+// FIX: repairMangledLpHead() applied at every LP/midnight page reception site (gap ladder, day loop, bulk, bulk-fallback probe, entry probes/pages,
+// midnight selective + pagination pages) — if the payload starts "<plausible fieldcount 03..1F>090c07e", prepend the constant struct tag '02'
+// (structural byte only, NEVER a meter value; marker LP_HEAD_REPAIR). Strict collector then sees the slot, merge keeps the record → 96/96. Historical
+// 22:00 holes self-heal: day gap-completion re-requests those exact slots on the next read (90-day Secure retention). NO in-range-mangled close guard
+// was added on purpose: HPL's genuine clockless rows have in-range loose stamps and MUST keep closing via RLS_GAP_IMPLICIT (V49 note).
 // VERSION: V55 — GAP-ENGINE AS THE RETRY PATH (17-07, from field log _17, SS09084148 Secure): V54 verified — midnight SOLVED (pagination 35/35, DB has Jul-2..16 kWh values), probe guard + day retry worked (Jul-15 answered on attempt 5 → gap-filled 96/96 in 8×0.7s pages). Midnight kWh deltas Jul-11..15 = 97-104/day (normal consumption) PROVE Jul-12/13/14 LP exists — every "NO_DATA" was an ignored request. Key pattern: requests with a POSITIVE-length window (gap pages, midnight pages) answered ~0.7s; the flaky ones are DAY requests (from=to=00:00, zero-length window). Four fixes: (1) GAP-DRIVE — a silent day is retried by driving lpFillDayGaps with empty coverage (positive-window pagination, the proven shape) instead of re-sending the day request; ≤10 days/session (RLS_SEL_DAY_GAPDRIVE / GAPDRIVE_OK). Replaces V54's naked RLS_SEL_DAY_LINKRETRY whose global 4-retry budget was burned entirely on day -1, leaving Jul-12/13/14 with zero retries. (2) GAP LADDER HEAL-AWARENESS — a page whose request needed an in-flight heal can never mark a range dead "confirmed" (log _17: Jul-11 16:45+ confirmed-dead after two heal-then-fast-empty pages that slipped past the lastSelHadResponse timeout guard) and gets one extra try on the healed link (RLS_GAP_LINKRETRY, ≤4/day; gapSawTimeout set on any healed page). (3) EARLY-STOP threshold 2→4 consecutive empty days when linkHealCount>0 (ignored requests masquerade as empty days); clean links keep 2. (4) ENTRY SWEEP fast-abort — probes silent AND sweep pages silent → stop after 2 pages, not 6 (selector-2 CONFIRMED never answering on SS-type Secure: probes + 6 sweep pages all silent on healed link = ~100s wasted in log _17).
 // VERSION: V54 — SILENCE≠ABSENCE COMPLETION (16-07, from field log _16, SS09084148 Secure + KT067921): V53 verified in the field (21 heal cycles, honest "Done with WARNINGS: Midnight PARTIAL 19/35"; KT067921 LP perfect 36 days/3,444 recs in 4.8 min). Three V53 blind spots closed: (1) MIDNIGHT PAGINATION — Secure firmware IGNORES the selective from-date (log _16 delivered Jun-12..30 against a Jul-2..16 request; midnight EIU=35 = every midnight Jun-12→Jul-16 recorded). After MIDNIGHT_KEEP_SEL, request onward from the newest received record (+1 day 00:00 → today), ≤6 pages, stop on zero-new; pages merged via mergeLpPageHexList into ONE 0100630200FF line (MIDNIGHT_PAGE_REQ/MIDNIGHT_PAGE/MIDNIGHT_PAGED markers). (2) ENTRY-PROBE LINK GUARD — LP_ENTRY_PROBE_TOP/BOTTOM fired mid-GPS-timeout-storm (log _16 11:39:22), read silence, set entryAccessDead → the end-of-LP entry sweep (the ONE path that bypasses Secure's broken time-range engine and would have recovered Jul-10..15) was skipped (LP_ENTRY_FALLBACK_SKIP). Now: relinkIfDirty before probes; probe silence with linkDirty/heals during probes → LP_ENTRY_PROBE_LINKFAIL, entry access stays available. entryAccessDead only from confirmed-empty probes on a clean link. (3) DAY-LOOP LINK RETRY — a NO_DATA day whose request needed healing (timeout→heal→empty) is redone once on the healed link before counting toward the 2-day early-stop (RLS_SEL_DAY_LINKRETRY, ≤4/session). Meter verdicts only from clean-link answers. NO CHANGE to MAX_LP_DAYS=35 (deliberate session cap; Secure SS meters retain 90 days — missed days stay recoverable ~3 months via the entry sweep).
 // VERSION: V53 — LINK-STATE MANAGER: SELF-HEALING HDLC + NEVER-DISCARD-DATA (15-07, from field log _15, SS09084148 Secure + KT326986 L&T): ROOT CAUSE — incomplete billing/LP/midnight ← every read after a truncated transfer returns silence/empty ← the meter IGNORES I-frames whose N(S)/N(R) don't match its window ← FrameType() INFERS the counters from received frames, so any transfer cut short (block abort, RR-loop break, deadline, timeout) leaves unread frames and desyncs the window ← nothing ever re-synced it. Gurux model: sequence state is only trustworthy after SNRM resets both sides; after a failed exchange, re-associate before reusing the link. (1) LINK-STATE MANAGER — linkDirty is set at EVERY abnormal transaction exit (all *_ABORT/_BREAK/_DEADLINE/_NO_RESPONSE/CONT_FAIL/ERROR_FRAME exits in GetParameter/GetParameter1/GetParameterSelective/GetParameter_LS); healLink() = AddressInit+SNRM+AARQ+drain (~1.5s); relinkIfDirty() guards ENTRY of all four transaction functions; in-loop: a silent first attempt heals + refreshRequestSequence() rewrites the pending frame's control byte + both FCS from the fresh counters. (2) MIDNIGHT NEVER-DISCARD — the old partial detector compared records-in-window vs EIU (whole buffer incl. pre-installation days) → false PARTIAL → discarded GOOD records → LS fallback timed out on the desynced link → 0 records + "Midnight OK". Now: expected=min(EIU, days+1); keep the selective result ALWAYS when it decodes records; LS runs as an UPGRADE on a healed link and replaces only if it yields MORE records; honest status Midnight OK/PARTIAL n/m/FAILED. (3) BILLING RETRY AFTER ABORT — GP1 block-transfer abort loses the newest billing records; now heals the link and re-reads the buffer once, keeping whichever result has more records; "Billing may be incomplete" warning if still aborted. (4) HONEST VERDICTS — "attr=3 absent → not supported" is only concluded on a CLEAN link; LP "confirmed empty" gets a re-read-advised warning when probes ran on a dirty link; session end says "Done with WARNINGS: …" + operator WARN instead of a false "All data OK".
@@ -9830,6 +9843,42 @@ public class Reading extends AppCompatActivity {
         }
     }
 
+    /**
+     * V56: restore the DLMS struct tag eaten by the 3-byte header strip.
+     *
+     * Log _18 (17-07, SS09084148): the last evening gap page (req 22:00→midnight)
+     * always arrives with its first 3 bytes gone — array tag, count and the first
+     * record's struct tag '02' — so the payload starts "<fieldcount>090c07e…"
+     * (e.g. "0b090c07ea070e02…"). The strict collector rightly skips the mangled
+     * record and mergeLpPageHexList drops it (ROW_FALLBACK recStart=88), which is
+     * why every optical-read day landed 95/96 with 22:00 IST missing while MRI-read
+     * days hold the full 96. The ladder even re-requested exactly 22:00→22:15 and
+     * got the same mangled shape back, so retrying can never fix it — repair can.
+     *
+     * Prepending the constant struct tag '02' restores the record exactly as the
+     * meter sent it: a structural byte only, never a meter value. The page stays
+     * headerless, which ROW_FALLBACK/HDR_FALLBACK already merge correctly, and the
+     * strict collector then counts the slot so the gap ladder closes for real.
+     */
+    private String repairMangledLpHead(String pageHex) {
+        try {
+            if (pageHex == null || pageHex.length() < 24) return pageHex;
+            String lower = pageHex.toLowerCase();
+            // Mangled shape: a plausible struct field-count byte followed directly
+            // by an octet-string(12) clock for year 0x07Ex — nothing legitimate
+            // starts this way (intact pages start with the array tag 01, and
+            // headerless-but-intact pages with the struct tag 02).
+            if (!lower.startsWith("090c07e", 2)) return pageHex;
+            int fieldCount = Integer.parseInt(lower.substring(0, 2), 16);
+            if (fieldCount < 0x03 || fieldCount > 0x1F) return pageHex;
+            appendLog("LP_HEAD_REPAIR fieldcount=" + fieldCount
+                    + " prefix=" + lower.substring(0, Math.min(16, lower.length())) + " (V56)");
+            return "02" + pageHex;
+        } catch (Exception ignored) {
+            return pageHex;
+        }
+    }
+
     private int lpFillDayGaps(UsbSerialPort port, java.util.Date dayStart, int capturePeriodMin,
                               java.util.TreeSet<Long> daySlots,
                               java.util.List<String> lpPageHexList,
@@ -9944,7 +9993,7 @@ public class Reading extends AppCompatActivity {
                 } catch (Exception ignored) {}
             }
 
-            String pageHex = (resp == null) ? "" : resp.toString().trim();
+            String pageHex = repairMangledLpHead((resp == null) ? "" : resp.toString().trim()); // V56
             boolean accepted = false;
             boolean knownOnly = false;
             if (!pageHex.isEmpty() && hasLoadProfileRecords(pageHex)) {
@@ -11514,7 +11563,7 @@ public class Reading extends AppCompatActivity {
                 relinkIfDirty(port, "LP-probes");
                 int probeHealsBefore = linkHealCount;
                 StringBuilder pTop = lpGetByEntry(port, Math.max(1, probeTopEntry - 2), probeTopEntry, capturePeriodMin);
-                String pTopHex = (pTop == null) ? "" : pTop.toString().trim();
+                String pTopHex = repairMangledLpHead((pTop == null) ? "" : pTop.toString().trim()); // V56
                 java.util.TreeSet<Long> topSlots = new java.util.TreeSet<>();
                 if (!pTopHex.isEmpty()) collectLpTimestamps(pTopHex, topSlots);
                 appendLog("LP_ENTRY_PROBE_TOP entries=" + Math.max(1, probeTopEntry - 2) + ".." + probeTopEntry
@@ -11538,7 +11587,7 @@ public class Reading extends AppCompatActivity {
                     }
                 } else {
                     StringBuilder pBot = lpGetByEntry(port, 1, 3, capturePeriodMin);
-                    String pBotHex = (pBot == null) ? "" : pBot.toString().trim();
+                    String pBotHex = repairMangledLpHead((pBot == null) ? "" : pBot.toString().trim()); // V56
                     java.util.TreeSet<Long> botSlots = new java.util.TreeSet<>();
                     if (!pBotHex.isEmpty()) collectLpTimestamps(pBotHex, botSlots);
                     appendLog("LP_ENTRY_PROBE_BOTTOM entries=1..3 records=" + botSlots.size()
@@ -11670,7 +11719,7 @@ public class Reading extends AppCompatActivity {
         }
 
         if (bulkReadOk) {
-            String lpHex = DLMdata.toString();
+            String lpHex = repairMangledLpHead(DLMdata.toString()); // V56
             // Extract declared entry count from 82 HH LL BER prefix
             try {
                 byte[] lpBytes = hexStringToByteArray(lpHex.length() > 1 ? lpHex : "");
@@ -11810,7 +11859,7 @@ public class Reading extends AppCompatActivity {
                                 this.bytWait, (byte) 1, this.bytTimOut, false,
                                 probeDate, probeDate, capturePeriodMin);
                         if (DLMdata != null && !DLMdata.toString().isEmpty()) {
-                            String probeHex = DLMdata.toString().trim();
+                            String probeHex = repairMangledLpHead(DLMdata.toString().trim()); // V56
                             if (hasLoadProfileRecords(probeHex)) {
                                 probeHadData = true;
                                 int probeCnt = countLoadProfileRecords(probeHex);
@@ -11844,7 +11893,7 @@ public class Reading extends AppCompatActivity {
                             DLMdata = this.GetParameter_LS(port, (byte) 7, "0100630100FF", (byte) 2,
                                     this.bytWait, (byte) 1, this.bytTimOut, false, bulkProbeSb);
                             if (DLMdata != null && DLMdata.length() > 30) {
-                                String bulkHex = DLMdata.toString().trim();
+                                String bulkHex = repairMangledLpHead(DLMdata.toString().trim()); // V56
                                 if (hasLoadProfileRecords(bulkHex)) {
                                     int bulkCnt = countLoadProfileRecords(bulkHex);
                                     probeHadData = true;
@@ -11949,7 +11998,7 @@ public class Reading extends AppCompatActivity {
                             dayDate, dayDate, capturePeriodMin);
 
                     if (DLMdata != null && !DLMdata.toString().isEmpty()) {
-                        String lpHex = DLMdata.toString().trim();
+                        String lpHex = repairMangledLpHead(DLMdata.toString().trim()); // V56
 
                         // V49: DAY-SEL DESYNC GUARD — the gap path has had this since
                         // V47, but a stale echo answering the DAY request itself was
@@ -12243,7 +12292,7 @@ public class Reading extends AppCompatActivity {
                         long lo = Math.max(1, hi - recPerDay + 1);
                         StringBuilder er = lpGetByEntry(port, lo, hi, capturePeriodMin);
                         entryPages++;
-                        String eh = (er == null) ? "" : er.toString().trim();
+                        String eh = repairMangledLpHead((er == null) ? "" : er.toString().trim()); // V56
                         java.util.TreeSet<Long> slots = new java.util.TreeSet<>();
                         if (!eh.isEmpty() && hasLoadProfileRecords(eh)) collectLpTimestamps(eh, slots);
                         int newCnt = 0;
@@ -12691,7 +12740,7 @@ public class Reading extends AppCompatActivity {
                 // records into 0 when the LS fallback timed out on a desynced link. Keep
                 // the partial, heal the link, attempt an LS upgrade, and replace only if
                 // LS yields MORE records.
-                String _selHex = _mp.length >= 4 ? _mp[_mp.length - 1].toLowerCase() : "";
+                String _selHex = repairMangledLpHead(_mp.length >= 4 ? _mp[_mp.length - 1].toLowerCase() : ""); // V56
                 int selCount = 0;
                 int _si = 0;
                 while ((_si = _selHex.indexOf("090c", _si)) >= 0) { selCount++; _si += 4; }
@@ -12757,7 +12806,7 @@ public class Reading extends AppCompatActivity {
                                             "0100630200FF", (byte) 2,
                                             this.bytWait, this.bytTryCnt, this.bytTimOut, false,
                                             pgFrom.getTime(), pgTo.getTime(), 1440);
-                                    String pgHex = (pgRes == null) ? "" : pgRes.toString().trim();
+                                    String pgHex = repairMangledLpHead((pgRes == null) ? "" : pgRes.toString().trim()); // V56
                                     TreeSet<Long> pgStamps = new TreeSet<>();
                                     if (!pgHex.isEmpty()) collectLpTimestampsLoose(pgHex, pgStamps);
                                     int pgNew = 0;
