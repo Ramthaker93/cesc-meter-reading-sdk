@@ -1,3 +1,17 @@
+// VERSION: V57-SDK — SESSION-START TIMESTAMP FIX (24-07, from L&T KT356784 field log +
+// EDIS-side investigation): MakeDataFile() stamped the TXT's "===SESSION START===" header
+// with new Date() at file-write time — i.e. session END, not session START. Harmless for a
+// quick read, but on a slow one (KT356784: 35-day Complete pull, 17:08:47→17:16:58, 8m11s)
+// the header ended up matching G2 (meter RTC, read late in the session) instead of being an
+// independent anchor, exactly as the field log's own diagnostic line flagged ("G3 is approx
+// same as G2 ... need to be identified accurately from mobile app txt file"). Fix: capture
+// nameplateReadTime right after the meter's identity confirms (Meter No read, ~0.4s into the
+// session — the earliest point we have a real physical timestamp for) and use that in the
+// header instead; falls back to file-write time only if nameplate read never completed
+// (early abort/failure). Reset to null at the top of runReading so a failed nameplate read
+// can't leak a stale value from a previous session. Also surfaced on the operator's screen
+// ("Done — <file> | Session start: <ts>") and added as MeterReadingResult.sessionStartTime
+// so the host app can show it without re-parsing the file (2026-07-24).
 // VERSION: V56-SDK — MANGLED-HEAD REPAIR (17-07, from field log _18 "onDemand1", SS09084148 Secure): V55 verified — gap-drive recovered 7 full days
 // (Jul 7-10, 12-14, ~672 recs) in one 10.5-min read; no false confirmed-dead; entry sweep stopped at 2 pages. ONE systematic gap remained: the 22:00
 // IST interval missing on EVERY optical-read day (DB stores UTC — "16:30" rows = 22:00 IST) while MRI-read days hold the full 96. ROOT CAUSE: the last
@@ -147,9 +161,15 @@ public class ReadingSDK {
         public final String manufacturer;
         public final String validationSummary;
         public final String rawData;
-        public MeterReadingResult(String fp, String mn, String mf, String vs, String raw) {
+        // V57: true session-start time (captured at nameplate confirmation, not
+        // file-write time) — same value now written into the TXT's SESSION START
+        // header. Surfaced here so the host app can show it on the read-summary
+        // screen without having to re-parse the file.
+        public final String sessionStartTime;
+        public MeterReadingResult(String fp, String mn, String mf, String vs, String raw, String sst) {
             filePath=fp; meterNo=mn; manufacturer=mf;
             validationSummary=vs; rawData=(raw!=null?raw:"");
+            sessionStartTime = sst;
         }
     }
 
@@ -195,6 +215,14 @@ public class ReadingSDK {
 
     // Abort flag — set by abort(); checked in SNRM loop and reading loops
     private volatile boolean abortRequested = false;
+    // V57: captured right when the meter's identity (nameplate) is confirmed —
+    // the earliest point in the session we have a real, physical timestamp for.
+    // MakeDataFile() previously stamped "SESSION START" with the file-write time
+    // (new Date() at the very end of the session), which for long reads (35-day
+    // Complete pulls can run 8+ minutes) made it converge with G2 and defeated
+    // its purpose as an independent anchor. Falls back to file-write time only
+    // if nameplate read never completed (e.g. early abort/failure).
+    private volatile Date    nameplateReadTime = null;
     // LP deadline — set before ReadLoadSurveyData, checked inside GPLS loops
     private volatile long    lpDeadlineMs    = 0;
     // V42: when non-null, GetParameterSelective encodes this exact datetime as the
@@ -363,6 +391,7 @@ public class ReadingSDK {
         phasePartialLp = false;
         phasePartialBilling = false;
         phaseBillingReached = false; // V44
+        nameplateReadTime = null; // V57: must not leak into a new session if this one's nameplate read fails
         cleanupTmpFiles(); // remove any .TMP from a previous crashed/aborted session
         currentMeterMake = meterMake;
         final String finalFileName = (fileName != null && !fileName.trim().isEmpty())
@@ -584,6 +613,7 @@ public class ReadingSDK {
                 }
                 CescRajMeterno = MeterNo; // Update with actual meter no
                 UpdateStatus(CescRajMeterno, "Meter No: " + MeterNo);
+                nameplateReadTime = new Date(); // V57: true session-start anchor for MakeDataFile
 
                 // Read Manufacturer name (OBIS 0000600800FF attr 2)
                 String manufacturerStr = "";
@@ -1023,13 +1053,20 @@ public class ReadingSDK {
                     }
                 }
 
+                // V57: session-start time shown to the operator right after the file is
+                // saved — same value written into the TXT header, so what the field agent
+                // sees on screen matches what ends up in the uploaded file.
+                String sessionStartDisplay = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
+                        .format(nameplateReadTime != null ? nameplateReadTime : new Date());
                 fireProgress(callback, "Done — " + Filenm
+                        + " | Session start: " + sessionStartDisplay
                         + (rtcWarningFlag ? " | ⚠ RTC WARNING: " + rtcWarningMessage : ""), 100);
                 String validationSummary = buildValidationBitmap(
                         lastMeterData != null ? lastMeterData.toString() : "");
                 fireComplete(callback, new MeterReadingResult(
                         Filenm, MeterNo, manufacturerStr, validationSummary,
-                        lastMeterData != null ? lastMeterData.toString() : ""));
+                        lastMeterData != null ? lastMeterData.toString() : "",
+                        sessionStartDisplay));
                 return;
         } catch (Exception ex) {
             appendLog("runReading ERROR: " + ex.getMessage());
@@ -4106,7 +4143,13 @@ public class ReadingSDK {
             int dataSizeKb = Data.length() / 1024;
             if (dataSizeKb > 4096) appendLog("WARN: TXT file size=" + dataSizeKb + " KB > 4 MB — XML converter may reject");
             BufferedWriter buf = new BufferedWriter(new FileWriter(tmpFile, false));
-            buf.append("===SESSION START " + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()) + "===");
+            // V57: use the nameplate-completion timestamp (captured right after the
+            // meter's identity is confirmed, near the true start of the session) instead
+            // of "now" — "now" here is file-write time, i.e. session END, which for long
+            // reads made this header converge with G2 instead of being an independent
+            // anchor. Falls back to file-write time if nameplate read never completed.
+            Date sessionAnchor = (nameplateReadTime != null) ? nameplateReadTime : new Date();
+            buf.append("===SESSION START " + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(sessionAnchor) + "===");
             buf.newLine();
             buf.append(Data);
             buf.newLine();

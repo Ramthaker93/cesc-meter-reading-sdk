@@ -8,6 +8,25 @@ comment block at the top of `metersdk/src/main/java/com/npcl/com/vcpopdl/Reading
 (mirrored in `app/src/main/java/com/npcl/com/vcpopdl/Reading.java`) — this file summarizes
 the same history at release granularity.
 
+## [app 1.1.32 / metersdk 1.1.32] - 2026-07-24
+
+### Fixed
+- **V57 — Session-start timestamp fix**: `MakeDataFile()` stamped the TXT's
+  `===SESSION START===` header with the file-write timestamp — i.e. the moment the
+  session *ended*, not started. Harmless on a quick read, but on a slow one (35-day
+  Complete pull spanning 8+ minutes) the header converged with the meter's own RTC
+  timestamp (read late in the session) instead of acting as an independent anchor.
+  Now captured right after the meter's identity is confirmed (Meter No read, ~0.4s
+  into the session) via `nameplateReadTime`, with a file-write-time fallback if the
+  nameplate read never completes. Also surfaced on the operator's screen
+  (`... | Session start: <ts>`) and, in `ReadingSDK`, as
+  `MeterReadingResult.sessionStartTime` so the host app can show it without
+  re-parsing the file.
+
+### Changed
+- `metersdk` published version bumped `1.1.31` → `1.1.32`.
+- App `versionCode` `2` → `3`, `versionName` `"1.1.31"` → `"1.1.32"`.
+
 ## [app 1.1.31 / metersdk 1.1.31] - 2026-07-17
 
 ### Fixed
