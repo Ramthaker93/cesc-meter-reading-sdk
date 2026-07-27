@@ -1,3 +1,25 @@
+// VERSION: V59-SDK — EARLIER FULL-RECONNECT TRIGGER + CHEAPER GAPDRIVE LADDER (27-07, from
+// Secure SS09121034 field log, TSL/CE/065_Dalveer, optical log SDK_OPTICAL_LOG_TSL_CE_065_Dalveer):
+// 15m read hit the 900s deadline at day 14/36 (286/~3360 records, ~8.5%). ROOT CAUSE: the
+// lightweight per-request healLink() (V53) cannot fix a genuinely desynced HDLC link — it only
+// re-associates enough to send the NEXT request, which then times out identically. The log
+// proves this directly: days -1..-3 (Jul 26/25/24) burned ~3 minutes total, every single
+// GAPDRIVE (V55) call ending added=0, each one separately exhausting its own 4-heal-retry
+// ladder — while the ONE mechanism that actually works, V37's full reconnect (DISC+SNRM+AARQ,
+// not just healLink()), was gated behind consecutiveEmptyDays>=4 && i>3 and only fired at day
+// -4 (11:07:47) — instantly fixing the link (NRM=true, AARQ=0) — after which every day through
+// -13 (session end) succeeded cleanly. The days lost to the wait (-1,-2,-3) were provably
+// recoverable; the gate just fired ~3 minutes too late. FIX: (1) lower both stall-reconnect
+// triggers (RLS_EMPTY_STALL_RECONNECT, RLS_STALL_RECONNECT) from consecutiveEmptyDays>=4/2
+// (gated on i>3) to >=2/1 with no day-index gate — the real fix is cheap (~300ms per this log)
+// so trying it earlier costs little even when a day genuinely has no data. (2) stalledReconnectDone
+// (one-shot boolean) replaced with stalledReconnectCount (cap 2) — a link that degrades a second
+// time later in a long session now gets a second real fix instead of being stuck with only
+// healLink() for the rest of the read. (3) lpFillDayGaps() gained a maxHealRetries parameter
+// (overload defaults existing call sites to 4, unchanged); the GAPDRIVE call site — already a
+// second-chance path invoked only after the day-request itself went fully silent — now uses 2,
+// so a truly-dead day concedes faster and the consecutive-empty-day counter (feeding the
+// reconnect trigger above) advances sooner instead of stalling a full ladder inside one day.
 // VERSION: V58-SDK — 7-DAY LOG AUTO-ROTATION (27-07): SDK_OPTICAL_LOG_<user>.TXT
 // accumulated forever with no cleanup (the header comment above startDiagLog claimed a
 // midnight/1-day purge that was never actually implemented — one file per user just kept
@@ -8506,6 +8528,19 @@ public class ReadingSDK {
                               TreeSet<Long> daySlots,
                               List<String> lpPageHexList,
                               HashSet<String> seenPayloads, int dayIndex) {
+        return lpFillDayGaps(port, dayStart, capturePeriodMin, daySlots, lpPageHexList,
+                seenPayloads, dayIndex, 4);
+    }
+
+    // V59: maxHealRetries overload — GAPDRIVE (day-request already went fully silent) is a
+    // second-chance path and shouldn't pay the same 4-retry ladder cost as the primary
+    // in-day gap fill; a smaller budget lets a truly-dead day give up faster so the
+    // consecutive-empty-day counter (and the full-reconnect trigger it feeds) advances
+    // sooner instead of stalling out inside one day's retry loop.
+    private int lpFillDayGaps(UsbSerialPort port, Date dayStart, int capturePeriodMin,
+                              TreeSet<Long> daySlots,
+                              List<String> lpPageHexList,
+                              HashSet<String> seenPayloads, int dayIndex, int maxHealRetries) {
         final long periodMs   = capturePeriodMin * 60_000L;
         final long dayStartMs = dayStart.getTime();
         final long nextDayMs  = dayStartMs + 24L * 3600_000L;
@@ -8710,14 +8745,14 @@ public class ReadingSDK {
                             + " — all timestamps already seen, escalating");
                 }
             }
-            if (!accepted && pageHadHeals && gapHealRetries < 4) {
+            if (!accepted && pageHadHeals && gapHealRetries < maxHealRetries) {
                 // V55: the failed page rode a freshly-healed link — retry the same gap
                 // once more without consuming a ladder attempt.
                 gapHealRetries++;
                 gapAttempts.put(gapStart, attempt - 1); // attempt not consumed
                 appendLog("RLS_GAP_LINKRETRY day=-" + dayIndex + " page=" + pages
                         + " heals=" + (linkHealCount - pageHealsBefore)
-                        + " retry=" + gapHealRetries + "/4 (V55)");
+                        + " retry=" + gapHealRetries + "/" + maxHealRetries + " (V55)");
                 continue;
             }
             if (!accepted) {
@@ -10585,7 +10620,7 @@ public class ReadingSDK {
                 String etaStr = etaSecs < 60 ? etaSecs + "s" : (etaSecs/60) + "m " + (etaSecs%60) + "s";
                 appendLog("LP: reading " + lsDays + " days | Target ~" + targetRecords
                         + " records | ETA ~" + etaStr);
-                boolean stalledReconnectDone = false; // V37: one reconnect attempt per LP read
+                int stalledReconnectCount = 0; // V59: up to 2 full-HDLC reconnects per LP read (was 1)
                 int consecutiveEmptyDays = 0;         // V37: track consecutive NO_DATA days
                 int daySelDesyncs = 0;                // V49: max 6 DAY-SEL stale-response recoveries
                 int gapDriveDays = 0;                 // V55: max 10 gap-engine drives of silent days
@@ -10656,18 +10691,22 @@ public class ReadingSDK {
 
                         // Filter: keep payload only if it appears to contain actual LP rows.
                         if (!hasLoadProfileRecords(lpHex)) {
-                            // V55: on a link that needed healing this session, "empty" days
+                            // V59: on a link that needed healing this session, "empty" days
                             // are often ignored requests (log _17: Jul-12/13/14 read empty
-                            // while midnight kWh deltas prove ~96 recs/day exist) — require
-                            // 4 consecutive before stopping; clean links keep the fast 2.
+                            // while midnight kWh deltas prove ~96 recs/day exist) — trigger
+                            // the reconnect after just 2 (clean links after 1): the real fix
+                            // (full SNRM+AARQ) is cheap, so trying it earlier costs little
+                            // even when a day genuinely has no data (field log 27-07
+                            // SS09121034: the old 4/2-gated-on-i>3 threshold let days -1..-3
+                            // burn ~3min before the reconnect finally fired at day -4).
                             consecutiveEmptyDays++;
                             appendLog("RLS_SEL_DAY day=-" + i + " EMPTY_SKIPPED len=" + lpHex.length()
                                     + " consecutiveEmpty=" + consecutiveEmptyDays);
-                            if (consecutiveEmptyDays >= ((linkHealCount > 0) ? 4 : 2) && i > 3) { // V55: link-suspect threshold
+                            if (consecutiveEmptyDays >= ((linkHealCount > 0) ? 2 : 1)) { // V59: was 4/2 gated on i>3
                                 // V46: consecutive empty-array days can be a jammed link from
                                 // a previous NO-RESPONSE gap request — try one reconnect first.
-                                if (!stalledReconnectDone && !abortRequested) {
-                                    stalledReconnectDone = true;
+                                if (stalledReconnectCount < 2 && !abortRequested) {
+                                    stalledReconnectCount++;
                                     appendLog("RLS_EMPTY_STALL_RECONNECT day=-" + i
                                             + " — empty arrays may be a stuck transfer, reconnecting");
                                     try {
@@ -10805,7 +10844,7 @@ public class ReadingSDK {
                                     + " drive=" + gapDriveDays + "/10 (V55)");
                             TreeSet<Long> gdSlots = new TreeSet<>();
                             int gdAdded = lpFillDayGaps(port, dayDate, capturePeriodMin,
-                                    gdSlots, lpPageHexList, seenPayloads, i);
+                                    gdSlots, lpPageHexList, seenPayloads, i, 2); // V59: cheaper ladder — second-chance path
                             if (gdAdded > 0) {
                                 totalActualRecords += gdAdded;
                                 selectiveOk++;
@@ -10820,14 +10859,15 @@ public class ReadingSDK {
                         }
                         consecutiveEmptyDays++;
                         appendLog("RLS_SEL_DAY day=-" + i + " NO_DATA consecutiveEmpty=" + consecutiveEmptyDays);
-                        if (consecutiveEmptyDays >= ((linkHealCount > 0) ? 4 : 2) && i > 3) { // V55: link-suspect threshold
-                            // V37: HDLC stall recovery — after 2+ consecutive empty days the meter's
-                            // HDLC state is likely corrupted by a partial-stall mid-block-transfer.
-                            // drainPort() cleared the Android USB FIFO but the meter still has
-                            // a pending block transfer outstanding.  One reconnect attempt (abort +
-                            // DISC+SNRM+AARQ) resets both sides; if it works, resume from this day.
-                            if (!stalledReconnectDone && !abortRequested) {
-                                stalledReconnectDone = true;
+                        if (consecutiveEmptyDays >= ((linkHealCount > 0) ? 2 : 1)) { // V59: was 4/2 gated on i>3 — GAPDRIVE already exhausted its own heal-retry ladder for this day and still got added=0, so waiting for more fully-dead days before trying the real fix only guarantees more lost days
+                            // V37: HDLC stall recovery — a NO_DATA day after GAPDRIVE's own
+                            // heal-retries failed means the meter's HDLC state is likely
+                            // corrupted by a partial-stall mid-block-transfer. drainPort()
+                            // cleared the Android USB FIFO but the meter still has a pending
+                            // block transfer outstanding. A full reconnect (DISC+SNRM+AARQ)
+                            // resets both sides; if it works, resume from this day.
+                            if (stalledReconnectCount < 2 && !abortRequested) {
+                                stalledReconnectCount++;
                                 appendLog("RLS_STALL_RECONNECT — " + consecutiveEmptyDays
                                         + " consecutive empty days; attempting HDLC reconnect at day=-" + i);
                                 try {
