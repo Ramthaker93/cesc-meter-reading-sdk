@@ -1,3 +1,10 @@
+// VERSION: V58-SDK — 7-DAY LOG AUTO-ROTATION (27-07): SDK_OPTICAL_LOG_<user>.TXT
+// accumulated forever with no cleanup (the header comment above startDiagLog claimed a
+// midnight/1-day purge that was never actually implemented — one file per user just kept
+// growing session after session). Fix: getLogFileFirstTimestamp() reads back the file's OWN
+// first "[yyyy-MM-dd HH:mm:ss] SESSION START" banner; startDiagLog() now deletes the file
+// before appending once that first entry is LOG_MAX_AGE_MS (7 days) old, so a clean new log
+// starts automatically instead of the file growing without bound (2026-07-27).
 // VERSION: V57-SDK — SESSION-START TIMESTAMP FIX (24-07, from L&T KT356784 field log +
 // EDIS-side investigation): MakeDataFile() stamped the TXT's "===SESSION START===" header
 // with new Date() at file-write time — i.e. session END, not session START. Harmless for a
@@ -67,8 +74,10 @@ import android.os.Handler;
 import android.os.Looper;
 import android.text.format.Time;
 import android.util.Log;
+import java.io.BufferedReader;
 import java.io.BufferedWriter;
 import java.io.File;
+import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.text.SimpleDateFormat;
@@ -360,6 +369,7 @@ public class ReadingSDK {
     private static final String LOG_PREFIX    = "SDK_OPTICAL_LOG_";
     private static final String LOG_SUFFIX    = ".TXT";
     private static final int    LOG_FLUSH_EVERY = 5;
+    private static final long   LOG_MAX_AGE_MS = 7L * 24 * 60 * 60 * 1000; // rotate log after 7 days
     private final StringBuilder logBuffer    = new StringBuilder();
     private int    logLineCount  = 0;
     private String currentLogPath = null;
@@ -4389,18 +4399,18 @@ public class ReadingSDK {
 
     // =====================================================================
     // =====================================================================
-    // DIAGNOSTIC FILE LOGGER — persistent rolling daily log
+    // DIAGNOSTIC FILE LOGGER — persistent rolling log, auto-cleaned every 7 days
     //
     // Design:
-    //   • Log file is kept for the current calendar day: CescRaj_OPTICAL_LOG_(N).TXT
-    //     where N increments within each day (e.g. LOG_1.TXT, LOG_2.TXT, ...).
-    //   • Each session APPENDS to the current day's file — logs are NOT cleared
-    //     between sessions within the same day.
-    //   • At midnight the next session creates a new file and deletes any log
-    //     files older than 1 day, keeping only today's logs.
+    //   • One file per user: SDK_OPTICAL_LOG_<user>.TXT — every session appends
+    //     to it, logs are NOT cleared between sessions.
+    //   • At session start, the file's OWN first "SESSION START" timestamp is
+    //     read back; once that first entry is 7+ days old, the whole file is
+    //     deleted before the new banner is written, so a fresh log starts
+    //     clean (V58: LOG_MAX_AGE_MS / getLogFileFirstTimestamp).
     //   • Each session header includes: date/time, meter make, mode, days.
-    //   • Buffers in memory, flushes every 50 lines to avoid IO overhead.
-    //   • Share any CescRaj_OPTICAL_LOG_*.TXT for diagnostics.
+    //   • Buffers in memory, flushes every 5 lines to avoid IO overhead.
+    //   • Share the SDK_OPTICAL_LOG_*.TXT file for diagnostics.
     // =====================================================================
     // Note: LOG_DIR_NAME, LOG_PREFIX, LOG_SUFFIX, LOG_FLUSH_EVERY, logBuffer,
     // logLineCount, currentLogPath declared in class fields above.
@@ -4433,8 +4443,8 @@ public class ReadingSDK {
 
     /**
      * Call once at session start.
-     * - Purges log files older than 1 calendar day.
-     * - Appends a session-start banner to today's rolling log file.
+     * - Deletes the log file once its own first entry is 7+ days old (fresh log after that).
+     * - Appends a session-start banner to the rolling log file.
      * - Records meter make, mode and LP days so each session is self-describing.
      *
      * @param meterMakeLabel  human-readable make name (e.g. "HPL", "Secure")
@@ -4460,9 +4470,18 @@ public class ReadingSDK {
             String userTag = sanitizeForFileName(userIdWithName);
             String logFileName = LOG_PREFIX + (userTag.isEmpty() ? "DEFAULT" : userTag) + LOG_SUFFIX;
             File logFile = new File(logDir, logFileName);
+
+            // V58: 7-day auto-rotation — once the file's OWN first SESSION START
+            // is 7+ days old, wipe it so a new log starts clean instead of growing forever.
+            if (logFile.exists()) {
+                long firstTs = getLogFileFirstTimestamp(logFile);
+                if (firstTs > 0 && (System.currentTimeMillis() - firstTs) >= LOG_MAX_AGE_MS) {
+                    logFile.delete();
+                }
+            }
             currentLogPath = logFile.getAbsolutePath();
 
-            // Append session banner (never truncate — all meter logs accumulate here)
+            // Append session banner (never truncate within the 7-day window — logs accumulate here)
             String ts = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
                     .format(new Date());
             BufferedWriter bw = new BufferedWriter(
@@ -4483,6 +4502,31 @@ public class ReadingSDK {
             // If log setup fails, log to a fallback path and continue
             currentLogPath = null;
         }
+    }
+
+    /** Reads the log file's first "[yyyy-MM-dd HH:mm:ss] SESSION START" banner and
+     *  returns its epoch millis, or -1 if the file is empty/unreadable/unparseable. */
+    private long getLogFileFirstTimestamp(File logFile) {
+        BufferedReader br = null;
+        try {
+            br = new BufferedReader(new FileReader(logFile));
+            String line;
+            while ((line = br.readLine()) != null) {
+                int start = line.indexOf('[');
+                int end   = line.indexOf(']');
+                if (start >= 0 && end > start) {
+                    String ts = line.substring(start + 1, end);
+                    try {
+                        Date d = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).parse(ts);
+                        return d.getTime();
+                    } catch (Exception ignored) {}
+                }
+            }
+        } catch (Exception ignored) {
+        } finally {
+            if (br != null) try { br.close(); } catch (Exception ignored) {}
+        }
+        return -1;
     }
 
     // Strips characters unsafe for filenames and caps length so the user id/name
