@@ -1,3 +1,31 @@
+// VERSION: V59 — DAY-PROBE LINK-FAILURE GUARD (31-07, from Genus field logs
+// SDK_OPTICAL_LOG_658237_Kumar31.TXT + SDK_OPTICAL_LOG_950010_Anshuman_Singh31.TXT,
+// meters BS022399/BS050083/KT202030/5019012 — 4/4 sessions, 2 operators, 2 days):
+// Load Profile came back with entries_in_use=0 on all four meters. The day-offset
+// empty-probe (RLS_PROBE_EMPTY_METER, last 3 days via GetParameterSelective) is
+// supposed to double-check that before giving up — but in every one of these
+// sessions, the FIRST probe day hit LINK_DIRTY (GPS_NO_RESPONSE/GPS_TIMEOUT), and
+// the remaining 3 probe days then "completed" in ~20ms total, physically
+// impossible for a real optical round-trip (every genuine exchange elsewhere in
+// these same logs takes 150-800ms+) — proving those probes never actually talked
+// to the meter. The code still logged RLS_PROBE_CONFIRMED_EMPTY and wrote a false
+// empty LP array (0100630100FF attr=02 "0100") into the TXT. Midnight's own
+// entries_in_use for the SAME meters correctly reported real history (36/144/60/30
+// days) via a different OBIS, confirming these meters are not actually empty — the
+// probe just never got a real answer. There is already a V53 comment acknowledging
+// this exact failure mode ("an empty verdict reached over a broken link is not a
+// verdict") and a warning message keyed off linkDirty at the write site — but that
+// warning is cosmetic; it never stopped the false marker from being written. And
+// the SIBLING probe just above this one (LP_ENTRY_PROBE_TOP/BOTTOM, by record
+// number instead of by date) already got the correct fix for this in V54 — it
+// checks linkDirty/linkHealCount around the probe and refuses to conclude "empty"
+// if the link needed healing. That protection was simply never ported to this
+// second, separate probe. FIX: apply the same V54-style guard to the day-offset
+// probe — track linkHealCount before the loop, and if the link is dirty or was
+// healed during the 3-day probe, treat the result as inconclusive (RLS_PROBE_LINKFAIL)
+// rather than confirmed-empty; downstream, omit the LP1 line entirely instead of
+// asserting zero records (RLS_LP_INCONCLUSIVE), so the file honestly reflects "not
+// checked" rather than just what was logged (2026-07-31).
 // VERSION: V58 — EARLIER FULL-RECONNECT TRIGGER + CHEAPER GAPDRIVE LADDER (27-07, from
 // Secure SS09121034 field log, TSL/CE/065_Dalveer, optical log SDK_OPTICAL_LOG_TSL_CE_065_Dalveer):
 // 15m read hit the 900s deadline at day 14/36 (286/~3360 records, ~8.5%). ROOT CAUSE: the
@@ -11768,6 +11796,12 @@ public class Reading extends AppCompatActivity {
         int[] lpEntriesDeclared = {entriesInUse};
         java.util.HashSet<String> seenPayloads = new java.util.HashSet<>();
         int totalActualRecords = 0;
+        // V59: declared here (not inside the "if (!bulkReadOk)" block below, where the
+        // rest of the probe logic lives) because the LP1 write-out at the end of this
+        // method — which needs to read this flag — runs unconditionally after that
+        // block, whether or not the bulk read succeeded. See RLS_PROBE_LINKFAIL /
+        // RLS_LP_INCONCLUSIVE below.
+        boolean probeLinkFailed = false;
 
         boolean tryBulk = (currentMeterMake == MeterMake.GENUS || currentMeterMake == MeterMake.AVON);
         if (tryBulk) {
@@ -11911,12 +11945,15 @@ public class Reading extends AppCompatActivity {
                     // All probe reads would return 0 records and we'd wrongly conclude
                     // the meter is empty. Skip the probe entirely and treat as unknown.
                     appendLog("RLS_PROBE_SKIPPED_ABORT — port failure before probe; LP state unknown, skipping");
+                    probeLinkFailed = true; // V59
                     // probeHadData stays false BUT we must not conclude empty;
                     // set entriesInUse to a sentinel so the outer check also skips
                     // (entriesInUse > 0 || probeHadData) → neither true → LP skipped
                     // which is the right outcome since the port is dead anyway.
                 } else {
                     appendLog("RLS_PROBE_EMPTY_METER — entries_in_use=0, probing recent days before skipping");
+                    relinkIfDirty(port, "LP-day-probes"); // V59
+                    int dayProbeHealsBefore = linkHealCount; // V59
                     for (int probeDayOffset = 0; probeDayOffset >= -3 && !probeHadData; probeDayOffset--) {
                         java.util.Calendar probeCal = java.util.Calendar.getInstance();
                         probeCal.add(java.util.Calendar.DAY_OF_YEAR, probeDayOffset);
@@ -11943,7 +11980,14 @@ public class Reading extends AppCompatActivity {
                             }
                         }
                     }
-                    if (!probeHadData) {
+                    // V59: silence caused by a dirty/healed link taught us nothing about
+                    // the meter — same reasoning as the existing V54 entry-probe fix.
+                    if (!probeHadData && (linkDirty || linkHealCount > dayProbeHealsBefore)) {
+                        probeLinkFailed = true;
+                        appendLog("RLS_PROBE_LINKFAIL heals=" + (linkHealCount - dayProbeHealsBefore)
+                                + " dirty=" + linkDirty + " — NOT confirming empty (link failure during day probe)");
+                    }
+                    if (!probeHadData && !probeLinkFailed) {
                         appendLog("RLS_PROBE_CONFIRMED_EMPTY — no LP data in last 3 days via selective");
                         // FIX: Some Secure meters (e.g. SS09096634, SS09112148, SS09118696) have a
                         // firmware defect where BOTH attr=7 (EIU) AND selective access (attr=2 with
@@ -12431,7 +12475,7 @@ public class Reading extends AppCompatActivity {
                 strbldDLMdata.append("\r\n0007 0100630100FF 02 ").append(mergedLp);
                 appendLog("RLS_LP_MERGED pages=" + lpPageHexList.size() + " totalRecords=" + totalActualRecords);
             }
-        } else {
+        } else if (!probeLinkFailed) {
             // V30: always write LP1 attr=02 even when buffer is empty, so the .NET
             // converter knows LP1 was checked. "0100" = DLMS array with 0 elements.
             strbldDLMdata.append("\r\n0007 0100630100FF 02 0100");
@@ -12442,6 +12486,12 @@ public class Reading extends AppCompatActivity {
                 sectionWarnings.add("LP empty NOT confirmed (link failures during probes) — re-read advised");
             else
                 sectionWarnings.add("LP empty (meter reports no interval data)");
+        } else {
+            // V59: probe was inconclusive — do NOT assert LP is empty; omit LP1
+            // entirely so the file honestly reflects "not checked" rather than a
+            // false zero.
+            appendLog("RLS_LP_INCONCLUSIVE — link failure during empty-probe; LP1 omitted, re-read required");
+            sectionWarnings.add("LP could not be verified (link failures during probe) — re-read required");
         }
 
         return strbldDLMdata;
