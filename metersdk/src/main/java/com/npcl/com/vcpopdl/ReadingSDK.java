@@ -1,3 +1,20 @@
+// VERSION: V63-SDK — BILLING CAPTURE-OBJECTS (D3 attr=3) LINK-FAILURE GUARD (01-08, from
+// BS058543: D3 buffer decode failed entirely — read produced only a thin 1-record
+// converter-side fallback instead of real billing history). The billing profile read
+// (0100620100FF class 7) has THREE steps: attr=3 capture-objects (column layout),
+// attr=2 buffer (data), attr=7 entries-in-use. attr=2 already had a retry-on-abort guard
+// (V53, gp1Aborted). attr=3 had none — its plain GetParameter() call marks the link dirty
+// internally on a truncated/failed multi-block transfer (GP_TIMEOUT/GP_NO_RESPONSE/
+// GP_CONT_FAIL/etc.) but returns whatever partial bytes it already had; the caller never
+// checked linkDirty/linkHealCount, so a truncated column list (BS058543: 4042 hex chars
+// vs. the ~6678 every other Secure meter read that same day) passed hasMeaningfulDlmsPayload's
+// correctly-lenient check and got written to the TXT as if complete. A wrong column count
+// poisons the ENTIRE billing decode downstream (misaligned row width), not just one field —
+// worse than a plain missing register, so this one gets a guarded retry rather than just a
+// skip. Same guard shape as day-probe (V60), entry-probe (V54), D2 compound (V62): a result
+// obtained during a link failure is a link verdict, not a meter verdict. On retry failure,
+// keeps the first attempt (so downstream doesn't null out) but flags it via sectionWarnings
+// so it's visible instead of silently accepted as complete.
 // VERSION: V62-SDK — D2 COMPOUND LINK-FAILURE GUARD (01-08, from BK082033, D3/D5/D6 all
 // succeeded but D2=0 in the DB): the Secure compound instantaneous snapshot read
 // (01005E5B00FF attr=3 then attr=2, in ReadInstantData) never checked linkDirty/
@@ -449,7 +466,7 @@ public class ReadingSDK {
     // matching specific tag text against source history (exactly what was needed to
     // confirm V60 was actually deployed for BK078355/BK069573, 2026-08-01). Logged at
     // the start of every session (see runReading) so this is a one-line grep from now on.
-    private static final String SDK_VERSION = "V62";
+    private static final String SDK_VERSION = "V63";
 
     // Diagnostic log
     private static final String LOG_DIR_NAME  = "CescRaj_SDK_LOGS";
@@ -9121,8 +9138,31 @@ public class ReadingSDK {
         }
 
         // STEP 3: Billing profile capture_objects (attr=3) — column definitions
+        // V63: guard against a link failure silently truncating the column list —
+        // see the V63-SDK changelog entry at the top of this file for why this one
+        // specifically gets a retry rather than a skip (a wrong column count poisons
+        // the whole downstream billing decode, not just this one field).
+        relinkIfDirty(port, "Billing-CO");
+        int billingCoHealsBefore = linkHealCount;
         DLMdata = this.GetParameter(port, (byte) 7, "0100620100FF", (byte) 3,
                 this.bytWait, this.bytTryCnt, this.bytTimOut, true, strbldDLMdata);
+        if (linkDirty || linkHealCount > billingCoHealsBefore) {
+            appendLog("BILLING_CO_LINKFAIL — healing and re-reading capture objects once");
+            relinkIfDirty(port, "Billing-CO-retry");
+            int billingCoRetryHealsBefore = linkHealCount;
+            StringBuilder billingCoRetry = this.GetParameter(port, (byte) 7, "0100620100FF", (byte) 3,
+                    this.bytWait, this.bytTryCnt, this.bytTimOut, true, strbldDLMdata);
+            boolean retryLinkFailed = linkDirty || linkHealCount > billingCoRetryHealsBefore;
+            if (!retryLinkFailed && hasMeaningfulDlmsPayload(billingCoRetry)
+                    && billingCoRetry.length() >= DLMdata.length()) {
+                DLMdata = billingCoRetry;
+                appendLog("BILLING_CO_RETRY_OK len=" + billingCoRetry.length());
+            } else {
+                appendLog("BILLING_CO_RETRY_STILL_FAILED firstLen=" + DLMdata.length()
+                        + " retryLen=" + billingCoRetry.length() + " — keeping first attempt, flagging incomplete");
+                sectionWarnings.add("Billing structure may be incomplete (link failure during read) — re-read recommended");
+            }
+        }
         if (hasMeaningfulDlmsPayload(DLMdata))
             strbldDLMdata.append(DLMdata);
         else
