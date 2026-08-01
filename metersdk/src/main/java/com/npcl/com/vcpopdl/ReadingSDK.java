@@ -1,3 +1,34 @@
+// VERSION: V62-SDK — D2 COMPOUND LINK-FAILURE GUARD (01-08, from BK082033, D3/D5/D6 all
+// succeeded but D2=0 in the DB): the Secure compound instantaneous snapshot read
+// (01005E5B00FF attr=3 then attr=2, in ReadInstantData) never checked linkDirty/
+// linkHealCount around either call, even though GetParameter()'s own multi-block
+// continuation loop already marks the link dirty on a failed/incomplete transfer before
+// returning whatever partial fragment it received. BK082033's attr=3 (capture-objects)
+// response was a single byte ("1c") — the start of what should have been a ~30-column
+// definition list — which passed hasMeaningfulDlmsPayload's correctly-lenient check
+// (not empty/zero/FF) and got written to the TXT as if complete. The converter then had
+// a declared column count with nothing to match it against and silently emitted zero D2
+// rows. Same guard shape as the day-probe (V60) and entry-probe (V54) fixes: a result
+// obtained during a link failure is a link verdict, not a meter verdict — now discarded
+// (INST_COMPOUND_LINKFAIL) instead of written as if it were a genuine complete answer.
+// VERSION: V61-SDK — GENUS/AVON BULK LP DISABLED (01-08, from EDIS-side DB audit +
+// SDK_OPTICAL_LOG_STARBKCESC08_Jitendra_na.TXT, meters BK078355/BK069573): V60 correctly
+// stopped LP day-probe link failures from being silently reported as confirmed-empty, but
+// a 14-day DB audit after V60 went live showed 47.5% of Genus Complete reads (28/59)
+// still coming back with LP+Midnight empty — vs 11.8% for Secure (4/34), 0% for HPL, same
+// operators/devices/cables. Root cause is upstream of the day-probe entirely: Genus/AVON's
+// bulk LP attempt (GetParameter_LS, tried before ANY selective read) fails often enough in
+// current field conditions to matter, and unlike an ordinary timeout it reports DM
+// (Disconnect Mode) — tearing down the whole DLMS session and forcing a full NRM+AARQ
+// re-association before Midnight/Events/LP (all of which run after this point) can
+// proceed. Secure/HPL never attempt this call, so they never pay this cost. Fix: tryBulk
+// forced false for all makes — Genus/AVON now go straight to the same day-by-day
+// selective path already proven safer for Secure/HPL, matching the reference
+// implementation's own approach (see the comment already above this line). SDK_VERSION
+// bumped to V61 to match (also added in this pass: SDK_VERSION is now logged at the start
+// of every session — there was previously no way to confirm which build produced a given
+// log without matching specific tag text against source history, which is exactly what
+// was needed to verify V60 was actually deployed before trusting this audit's data).
 // VERSION: V60-SDK — DAY-PROBE LINK-FAILURE GUARD (31-07, from Genus field logs
 // SDK_OPTICAL_LOG_658237_Kumar31.TXT + SDK_OPTICAL_LOG_950010_Anshuman_Singh31.TXT,
 // meters BS022399/BS050083/KT202030/5019012 — 4/4 sessions, 2 operators, 2 days):
@@ -414,6 +445,12 @@ public class ReadingSDK {
         return n;
     }
 
+    // FIX 2026-08-01: no way to tell which build produced a given debug log without
+    // matching specific tag text against source history (exactly what was needed to
+    // confirm V60 was actually deployed for BK078355/BK069573, 2026-08-01). Logged at
+    // the start of every session (see runReading) so this is a one-line grep from now on.
+    private static final String SDK_VERSION = "V62";
+
     // Diagnostic log
     private static final String LOG_DIR_NAME  = "CescRaj_SDK_LOGS";
     private static final String LOG_PREFIX    = "SDK_OPTICAL_LOG_";
@@ -558,6 +595,7 @@ public class ReadingSDK {
         StringBuilder lastMeterData = null;
         try {
             startDiagLog(meterMake.getDisplayName(), readingMode.getDisplayName(), lsDays, userIdWithName, userRole);
+            appendLog("SDK_VERSION=" + SDK_VERSION);
             appendLog("=== runReading START mode=" + readingMode.getDisplayName() + " ===");
             fireProgress(callback, "Starting reading — " + readingMode.getDisplayName(), 5);
 
@@ -10389,7 +10427,25 @@ public class ReadingSDK {
         // RLS_LP_INCONCLUSIVE below.
         boolean probeLinkFailed = false;
 
-        boolean tryBulk = (currentMeterMake == MeterMake.GENUS || currentMeterMake == MeterMake.AVON);
+        // FIX 2026-08-01 (EDIS-side DB audit, 14-day window): Genus bulk was meant to be
+        // an optimisation over Secure/HPL's day-by-day-only path, but in current field
+        // conditions it's doing the opposite — 47.5% of Genus Complete reads (28/59) came
+        // back with LP+Midnight entirely empty, vs 11.8% for Secure (4/34) and 0% for HPL
+        // over the same window, all on the same operators/devices/cables. Root cause: when
+        // the bulk attempt above fails, it doesn't just waste time — GetParameter_LS
+        // failing on Genus routes through the SAME GP_CONT_FAIL path as any other call
+        // (see markLinkDirty("GP_CONT_FAIL") upstream) and additionally reports DM
+        // (Disconnect Mode, lastGplsResult==2), tearing down the whole DLMS session and
+        // forcing a full NRM+AARQ re-association (RLS_BULK_RECOVER_*) before ANYTHING
+        // else in the session — including Midnight/Events, which run BEFORE this point —
+        // can proceed reliably. Secure/HPL never attempt this call at all, so they never
+        // pay this cost; their worst case is an ordinary per-request timeout recovered by
+        // the lighter healLink(), not a session-wide teardown. Disabling bulk for both
+        // Genus and AVON (grouped together above since AVON was always bundled with Genus
+        // for this same code path) routes everyone through the same day-by-day selective
+        // path already proven safer for Secure/HPL — trading bulk's speed-when-it-works
+        // for the reliability the field data shows it isn't currently delivering.
+        boolean tryBulk = false;
         if (tryBulk) {
             appendLog("RLS_CALL attr=2 bulk (Genus/AVON only)");
             StringBuilder attr2Sb = new StringBuilder();
@@ -10583,11 +10639,17 @@ public class ReadingSDK {
                         // If it returns records → set probeHadData=true so the day loop runs.
                         // Safe for ALL makes:
                         //   - L&T/HPL with truly empty buffer: bulk returns empty array → no impact
-                        //   - Genus/AVON: already handled by bulkRead above (tryBulk=true)
+                        //   - Genus/AVON: FIX V61 — the primary bulk attempt above is now disabled
+                        //     for these makes entirely (tryBulk forced false, see that comment), so
+                        //     this single last-resort attempt is their ONLY chance at recovering data
+                        //     from a meter whose entries_in_use lied. The exclusion that used to be
+                        //     here ("already handled by bulkRead above") is stale now that bulk is
+                        //     no longer tried at all for these makes — removed. This is a single,
+                        //     late, narrow attempt (only reached when both EIU=0 and the day-probe
+                        //     already found nothing) — much lower risk than the primary attempt V61
+                        //     disabled, which ran first and unconditionally on every Genus/AVON read.
                         //   - Secure with firmware bug: bulk returns full buffer → data recovered
-                        if (!abortRequested && currentMeterMake != MeterMake.GENUS
-                                && currentMeterMake != MeterMake.AVON) {
-                            // Genus/AVON already tried bulk above; avoid duplicate bulk attempt
+                        if (!abortRequested) {
                             appendLog("RLS_BULK_FALLBACK_PROBE — selective empty, attempting direct attr=2 bulk read");
                             StringBuilder bulkProbeSb = new StringBuilder();
                             DLMdata = this.GetParameter_LS(port, (byte) 7, "0100630100FF", (byte) 2,
@@ -12104,12 +12166,34 @@ public class ReadingSDK {
         // LP newest-first reads) as array[count=2][struct[29]], consuming all subsequent
         // D2 lines trying to fill 2×29 fields, resulting in D2 absent from XML (2026-06-30)
         if (isSecureMeter()) {
+            // FIX V62 (BK082033, 2026-08-01): GetParameter()'s own multi-block
+            // continuation loop already detects a failed/incomplete transfer and calls
+            // markLinkDirty("GP_CONT_FAIL") before returning whatever partial fragment
+            // it received — but this call site never checked that, so a 1-byte fragment
+            // ("1c" — the start of what should have been a ~30-column definition list)
+            // passed hasMeaningfulDlmsPayload's (correctly) lenient empty/zero/FF check
+            // and got written to the TXT as if it were the complete attr=3 response.
+            // The converter then had a declared column count with no columns to match
+            // it against and silently emitted zero D2 rows for the whole file. Same
+            // reasoning as the day-probe (V60) and entry-probe (V54) fixes: a result
+            // obtained during a link failure is a link verdict, not a meter verdict —
+            // discard it instead of writing a partial capture that downstream can't
+            // tell apart from a genuine complete answer.
+            int instCompoundHealsBefore = linkHealCount;
             DLMdata = this.GetParameter(port, (byte) 7, "01005E5B00FF", (byte) 3,
                     this.bytWait, this.bytTryCnt, this.bytTimOut, true, strbldDLMdata);
-            if (hasMeaningfulDlmsPayload(DLMdata)) strbldDLMdata.append(DLMdata);
+            if (hasMeaningfulDlmsPayload(DLMdata) && !linkDirty && linkHealCount == instCompoundHealsBefore)
+                strbldDLMdata.append(DLMdata);
+            else if (hasMeaningfulDlmsPayload(DLMdata))
+                appendLog("INST_COMPOUND_LINKFAIL attr=3 — discarding partial capture-objects, link failed mid-transfer");
+
+            instCompoundHealsBefore = linkHealCount;
             DLMdata = this.GetParameter(port, (byte) 7, "01005E5B00FF", (byte) 2,
                     this.bytWait, this.bytTryCnt, this.bytTimOut, true, strbldDLMdata);
-            if (hasMeaningfulDlmsPayload(DLMdata)) strbldDLMdata.append(DLMdata);
+            if (hasMeaningfulDlmsPayload(DLMdata) && !linkDirty && linkHealCount == instCompoundHealsBefore)
+                strbldDLMdata.append(DLMdata);
+            else if (hasMeaningfulDlmsPayload(DLMdata))
+                appendLog("INST_COMPOUND_LINKFAIL attr=2 — discarding partial snapshot data, link failed mid-transfer");
         }
 
         // ── V50: SCALER ATTR=3 COMPLETENESS SWEEP ────────────────────────────
