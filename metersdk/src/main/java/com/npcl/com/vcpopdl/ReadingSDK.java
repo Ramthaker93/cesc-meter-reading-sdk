@@ -1,3 +1,50 @@
+// VERSION: V65-SDK — GP1_SEG_RESTART RESTORED (03-08, real regression, not a new fix):
+// user reported billing corruption (SS09096714, BK114616, BK018985 Total-energy values
+// wrong by orders of magnitude) could NOT be explained by meter-side memory corruption —
+// insisted this only started after the LP-interval-data fixing work and demanded the
+// actual Java/converter change history be checked, not just re-diagnosed from symptoms.
+// That was right: memory (project-hdlc-3byte-bug, "GP1 BILLING-PATH ECHO SPLICE",
+// 2026-07-10) documents this EXACT class of bug — GetParameter1's nested HDLC
+// continuation-frame loop appends a block's continuation frames raw from bytAddMode+8.
+// When a LATE RETRANSMISSION of a full prior response arrives in that slot instead
+// (carrying its own LLC E6E700 + C4 01/02 envelope), it gets spliced in as if it were
+// plain continuation bytes — 14 envelope bytes plus a duplicate payload copy land mid-
+// buffer (original field evidence: KT326986 billing capture-list corrupted at byte 106,
+// whole billing history mis-mapped, kWh showed as 0; KT280549 scaler columns shifted,
+// TODs off by 10x — the same shape of damage as this investigation's findings). The fix
+// (GP1_SEG_RESTART) was implemented and verified in Reading_V50/V51/V52.java. It never
+// made it into ReadingSDK.java — the class the field APK actually builds from — because
+// the V51→V53 port to that class was already known-incomplete for OTHER reasons
+// (SEL_ENTRY_FRAME, lpFrameReceived call sites, per the same memory entry) and silently
+// dropped this too. Every SDK version since (V53 through V64, ~4 weeks of field builds)
+// shipped without it. Restored verbatim from Reading_V50.java (rcvHasLlc()/llcDataStart()
+// themselves survived the port — only this specific application of them was lost) into
+// the matching loop in GetParameter1 (the "myLogic" segmentation loop). NOTE: V50 itself
+// only ever protected this one loop, not the sibling per-block receive loop a few dozen
+// lines earlier (GPLS_CONT_RECOVER/contFrameCount) — that gap is real but pre-existing
+// and unproven, not part of this restoration; flagged separately, not fixed here.
+// VERSION: V64-SDK — CHRONIC-LINK SESSION REJECTION (03-08, from BK018985 5 heals /
+// BK114616 4 heals, both on V63 builds): V53's retry-on-abort correctly recovers from an
+// EXPLICIT stall (GP1_BLOCK_DEADLINE_ABORT etc.) by re-reading and keeping the more-complete
+// attempt — but the retry itself can complete with no further timeout/abort logged, and
+// STILL contain silently corrupted values, if the underlying link was marginal for the
+// whole session rather than just that one moment. BK018985 and BK114616 both showed 4-5
+// separate LINK_DIRTY/LINK_HEAL events across totally different read phases (instant,
+// billing, midnight) in the same ~3-minute session — every individual phase "succeeded" by
+// its own local checks, yet the resulting billing history (Total energy AND Maximum Demand)
+// had specific historical entries silently wrong by 2-3 orders of magnitude. No existing
+// guard catches this because none of them look at cumulative session-wide link health —
+// each only asks "did THIS ONE read fail", never "has this session already proven the link
+// is untrustworthy". Fix: linkHealCount (already tracked, previously just logged for
+// diagnostics as SESSION_LINK_HEALS) is now a hard gate. 2+ heals in one session — the same
+// threshold that separates a single self-healed hiccup (fine, that's what V53 is for) from
+// a chronically bad link (BK018985=5, BK114616=4) — now BLOCKS the TXT from being written
+// at all. MakeDataFile is skipped entirely; fireError() tells the operator the link was
+// unstable and this meter must be re-read, instead of silently shipping a file that looks
+// complete but isn't trustworthy. This intentionally overrides the V44 SAVE-TILL-BILLING
+// philosophy ("save whatever we got") for this one case — a technically-complete file whose
+// own session history says the link can't be trusted is worse than no file, because it
+// looks identical to a good read from the server side with no way to tell them apart.
 // VERSION: V63-SDK — BILLING CAPTURE-OBJECTS (D3 attr=3) LINK-FAILURE GUARD (01-08, from
 // BS058543: D3 buffer decode failed entirely — read produced only a thin 1-record
 // converter-side fallback instead of real billing history). The billing profile read
@@ -394,6 +441,9 @@ public class ReadingSDK {
     private boolean linkDirty = false;
     private String  linkDirtyReason = "";
     private int     linkHealCount = 0;      // per-session heal counter (diagnostics)
+    // V64: a session that needed 2+ link heals is chronically unstable, not a single
+    // isolated hiccup — see the V64-SDK changelog entry at the top of this file.
+    private static final int LINK_HEAL_REJECT_THRESHOLD = 2;
     private boolean gp1Aborted = false;     // set when a billing block transfer is cut short
     private final java.util.ArrayList<String> sectionWarnings = new java.util.ArrayList<>();
     private int midnightRecCount = -1;      // records actually secured by ReadMidnightSnapshot
@@ -466,7 +516,7 @@ public class ReadingSDK {
     // matching specific tag text against source history (exactly what was needed to
     // confirm V60 was actually deployed for BK078355/BK069573, 2026-08-01). Logged at
     // the start of every session (see runReading) so this is a one-line grep from now on.
-    private static final String SDK_VERSION = "V63";
+    private static final String SDK_VERSION = "V65";
 
     // Diagnostic log
     private static final String LOG_DIR_NAME  = "CescRaj_SDK_LOGS";
@@ -1133,6 +1183,22 @@ public class ReadingSDK {
                     }
                 }
                 // ============================================================
+
+                // V64: chronic-link session rejection — see the V64-SDK changelog entry at
+                // the top of this file. A session that needed this many self-heals has
+                // already proven its link can't be trusted, even on phases that reported
+                // no explicit failure. Block the write entirely rather than ship a file
+                // that looks complete but may carry silently corrupted values.
+                if (linkHealCount >= LINK_HEAL_REJECT_THRESHOLD) {
+                    appendLog("SESSION_REJECTED_CHRONIC_LINK heals=" + linkHealCount
+                            + " threshold=" + LINK_HEAL_REJECT_THRESHOLD + " — TXT not written");
+                    flushLog();
+                    UpdateStatus(CescRajMeterno, "REJECTED — unstable link (" + linkHealCount + " heals), re-read required");
+                    fireError(callback, "Link was unstable during this read (" + linkHealCount
+                            + " reconnects needed) — billing/demand data may be unreliable. "
+                            + "This meter was NOT saved. Please re-read it, ideally with a fresh cable connection.");
+                    return;
+                }
 
                 fireProgress(callback, "Saving data file...", 85);
                 String cleanMeterNo = MeterNo.replace("\r\n","").replace("\n","").replace("\t","").trim();
@@ -6328,8 +6394,44 @@ public class ReadingSDK {
                         flag4 = receiveFrame(port, original + ((int) nTimeOut * 1000L));
                         if (flag4) {
                             num66 = (byte) 0;
-                            for (int index21 = ((0xff & this.bytAddMode) + 8); index21 < this.pktLength - 1; ++index21)
-                                strbldDLMdata.append(Hex2Digit(this.nRcvPkt[index21]));
+                            // V50 GP1_SEG_RESTART, re-added 2026-08-03 — this guard was in
+                            // V50/V51/V52 (Reading.java) but was lost when the SDK class was
+                            // ported at the V53 split (see memory project-hdlc-3byte-bug).
+                            // A genuine continuation frame's payload is raw APDU bytes
+                            // starting right at bytAddMode+8. A LATE RETRANSMISSION of a full
+                            // prior response instead carries its own LLC envelope (E6 E7 00)
+                            // + C4 01/02 GetResponse header at that same position — appending
+                            // it as if it were plain continuation bytes splices 14 envelope
+                            // bytes plus a duplicate payload copy into the data (KT326986
+                            // 2026-07-10: billing capture-list corrupted at byte 106, whole
+                            // billing history mis-mapped, kWh total showed as 0; KT280549:
+                            // scaler columns shifted, TODs off by 10x). Detected: discard the
+                            // partial first copy and restart collection from this full frame,
+                            // using the same envelope offsets as the first-frame path.
+                            int segStart = (0xff & this.bytAddMode) + 8;
+                            if (rcvHasLlc() && (0xff & this.nRcvPkt[segStart + 3]) == 0xC4) {
+                                strbldDLMdata.setLength(0);
+                                int dsRestart;
+                                if ((0xff & this.nRcvPkt[segStart + 4]) == 2) {
+                                    num1 = (((long)(this.nRcvPkt[((0xff & this.bytAddMode) + 15)] & 0xFF)) << 24)
+                                            | (((long)(this.nRcvPkt[((0xff & this.bytAddMode) + 16)] & 0xFF)) << 16)
+                                            | (((long)(this.nRcvPkt[((0xff & this.bytAddMode) + 17)] & 0xFF)) << 8)
+                                            |  ((long)(this.nRcvPkt[((0xff & this.bytAddMode) + 18)] & 0xFF));
+                                    flag1 = !IntToBool(0xff & this.nRcvPkt[((0xff & this.bytAddMode) + 14)]);
+                                    int berRestart = 0xff & this.nRcvPkt[(int) this.bytAddMode + 20];
+                                    dsRestart = (0xff & this.bytAddMode)
+                                            + (berRestart == 130 ? 23 : (berRestart == 129 ? 22 : 21));
+                                } else {
+                                    dsRestart = (0xff & this.bytAddMode) + 15;
+                                }
+                                appendLog("GP1_SEG_RESTART — retransmitted full response detected,"
+                                        + " partial copy discarded, collection restarted");
+                                for (int index21 = dsRestart; index21 < this.pktLength - 1; ++index21)
+                                    strbldDLMdata.append(Hex2Digit(this.nRcvPkt[index21]));
+                            } else {
+                                for (int index21 = segStart; index21 < this.pktLength - 1; ++index21)
+                                    strbldDLMdata.append(Hex2Digit(this.nRcvPkt[index21]));
+                            }
                             myLogic = true;
                             this.FrameType();
                         } else {
