@@ -1,3 +1,42 @@
+// VERSION: V67-SDK — V64 CHRONIC-LINK REJECTION REMOVED, REPLACED WITH HEADER STAMP
+// (04-08, evidence from SS09096714 Aug-3/Aug-4 sessions + user's correct challenge):
+// V64 refused to write the TXT when a session needed >=2 link heals, on the premise
+// that a shaky link silently corrupts data. Both halves of that premise are now dead.
+// (1) The heals aren't measuring link health: SS-type Secure firmware IGNORES
+// zero-length-window day-selective LP requests (documented V54/V55 on SS09084148) —
+// each ignored request marks the link dirty, the heal (SNRM+AARQ, full association +
+// authentication) then succeeds instantly (SS09096714: 52/52 LINK_HEAL_OK, zero NRM/
+// AARQ failures — cable and auth provably fine), and the V55 GAPDRIVE fallback fetches
+// the same days via positive-window requests the meter answers in ~0.7s. The Aug-3
+// "52-heal" session recovered a full 1,417-record LP (the complete LP visible in EDIS
+// came from exactly that file) and, after the V66-era converter repair, perfect billing
+// too. V64 made Complete mode permanently unsaveable on this whole meter family while
+// throwing away good data. (2) The silent corruption V64 guarded against was the
+// signed-byte BER splice — root-caused and fixed at source in V66; transit is FCS-
+// protected; the converter's RepairSplicedBerRemnants + the server's d3_quality_flags
+// catch anything residual. V67: always save; stamp SESSION_LINK_HEALS=N into the TXT
+// header (server-side visibility, line is ignored by the converter's prefix-based
+// header parsing); heals >= 10 additionally surfaces as an operator WARNING via
+// sectionWarnings ("Done with WARNINGS") instead of a rejection.
+// VERSION: V66-SDK — SIGNED-BYTE BER MASK FIX (04-08, SS09096714 "14.054" root cause,
+// PROVEN byte-for-byte): four block/continuation extraction sites compared the BER
+// length-form byte with "(int) this.nRcvPkt[+20] == 130" — Java bytes are SIGNED, so
+// (int)(byte)0x82 = -126 and the comparison is ALWAYS false (same for 0x81 vs 129).
+// Any block whose payload is >=128 bytes (long-form BER 82 xx xx) therefore fell into
+// the else branch and was copied from +21 instead of +23, pasting the next block's
+// 2-byte length (e.g. 01F4 = 500) into the reassembled data as if it were meter bytes.
+// SS09096714's Complete TXT: 9 such 2-byte strays at exactly every block boundary
+// (1000/2004/3008... hex); stripping them yields a perfect 13/13-row decode whose every
+// value matches the meter's true registers (independently confirmed against an OEM MRI
+// read digit-for-digit: Aug-1 kVAh Total 99053.161, May-26 82012.169, Dec-25 70023.616 —
+// where the spliced stream had produced 14.054/0/0 via one-column shifts). The bug is
+// ancient (present in Reading V25) but sibling sites — including the FIRST-response
+// block-1 path — were already masked "(int)(0xff & ...)" long ago, which is precisely
+// why D3-00/current-bill values (block 1) were always correct and only deep-history
+// rows crossing block boundaries corrupted, and why routine billing never caught it.
+// Fixed all four remaining unmasked pairs (GetParameter1 next-block, GetParameter,
+// GetParameterSelective, GetParameterLS). Converter side gains a matching validated
+// stray-strip repair so ALREADY-CAPTURED TXTs decode correctly on reprocess.
 // VERSION: V65-SDK — GP1_SEG_RESTART RESTORED (03-08, real regression, not a new fix):
 // user reported billing corruption (SS09096714, BK114616, BK018985 Total-energy values
 // wrong by orders of magnitude) could NOT be explained by meter-side memory corruption —
@@ -441,9 +480,8 @@ public class ReadingSDK {
     private boolean linkDirty = false;
     private String  linkDirtyReason = "";
     private int     linkHealCount = 0;      // per-session heal counter (diagnostics)
-    // V64: a session that needed 2+ link heals is chronically unstable, not a single
-    // isolated hiccup — see the V64-SDK changelog entry at the top of this file.
-    private static final int LINK_HEAL_REJECT_THRESHOLD = 2;
+    // (V64's LINK_HEAL_REJECT_THRESHOLD removed in V67 — heals measure the SS-type
+    // day-request firmware quirk, not link health; see V67-SDK changelog entry.)
     private boolean gp1Aborted = false;     // set when a billing block transfer is cut short
     private final java.util.ArrayList<String> sectionWarnings = new java.util.ArrayList<>();
     private int midnightRecCount = -1;      // records actually secured by ReadMidnightSnapshot
@@ -516,7 +554,7 @@ public class ReadingSDK {
     // matching specific tag text against source history (exactly what was needed to
     // confirm V60 was actually deployed for BK078355/BK069573, 2026-08-01). Logged at
     // the start of every session (see runReading) so this is a one-line grep from now on.
-    private static final String SDK_VERSION = "V65";
+    private static final String SDK_VERSION = "V67";
 
     // Diagnostic log
     private static final String LOG_DIR_NAME  = "CescRaj_SDK_LOGS";
@@ -1169,6 +1207,11 @@ public class ReadingSDK {
                         // session whose midnight AND load profile were completely empty.
                         if (linkHealCount > 0)
                             appendLog("SESSION_LINK_HEALS=" + linkHealCount);
+                        // V67: surface a heavy heal count to the operator as a warning
+                        // (not a rejection) — must be added BEFORE the isEmpty() check
+                        // below so it reaches the "Done with WARNINGS" status line.
+                        if (linkHealCount >= 10)
+                            sectionWarnings.add("Link needed " + linkHealCount + " reconnects (typical SS-type day-request quirk; data recovered via fallbacks)");
                         if (sectionWarnings.isEmpty()) {
                             UpdateStatus(CescRajMeterno, "All data OK");
                             fireProgress(callback, "✓ Complete read OK (" + (sessionElapsed/1000) + "s)", 80);
@@ -1184,21 +1227,21 @@ public class ReadingSDK {
                 }
                 // ============================================================
 
-                // V64: chronic-link session rejection — see the V64-SDK changelog entry at
-                // the top of this file. A session that needed this many self-heals has
-                // already proven its link can't be trusted, even on phases that reported
-                // no explicit failure. Block the write entirely rather than ship a file
-                // that looks complete but may carry silently corrupted values.
-                if (linkHealCount >= LINK_HEAL_REJECT_THRESHOLD) {
-                    appendLog("SESSION_REJECTED_CHRONIC_LINK heals=" + linkHealCount
-                            + " threshold=" + LINK_HEAL_REJECT_THRESHOLD + " — TXT not written");
-                    flushLog();
-                    UpdateStatus(CescRajMeterno, "REJECTED — unstable link (" + linkHealCount + " heals), re-read required");
-                    fireError(callback, "Link was unstable during this read (" + linkHealCount
-                            + " reconnects needed) — billing/demand data may be unreliable. "
-                            + "This meter was NOT saved. Please re-read it, ideally with a fresh cable connection.");
-                    return;
-                }
+                // V67: the V64 chronic-link hard rejection is REMOVED — see the V67-SDK
+                // changelog entry at the top of this file. Field evidence killed its
+                // premise: SS-type Secure firmware IGNORES zero-length-window day-selective
+                // LP requests (documented V54/V55, SS09084148), so every such meter racks
+                // up dozens of heals per session while SNRM+AARQ succeed 100% of the time
+                // (SS09096714 Aug-3: 52/52 heals OK, full 1,417-record LP recovered via
+                // GAPDRIVE, billing perfect after converter repair) — the heals measure a
+                // firmware quirk, not link health, and the gate made Complete mode
+                // permanently unsaveable on those meters. The corruption V64 guarded
+                // against is root-caused and fixed at source (V66 signed-byte masks; FCS
+                // protects transit; converter repair + d3_quality_flags catch residue).
+                // Instead: stamp the heal count into the TXT header for server-side
+                // visibility, and tell the operator via the warning channel.
+                if (linkHealCount > 0)
+                    fileHeader += "SESSION_LINK_HEALS=" + linkHealCount + "\r\n";
 
                 fireProgress(callback, "Saving data file...", 85);
                 String cleanMeterNo = MeterNo.replace("\r\n","").replace("\n","").replace("\t","").trim();
@@ -5415,12 +5458,12 @@ public class ReadingSDK {
             // then the actual DLMS data value (array tag onward).
             // Adding 8 to each offset skips these header bytes so the XML parser
             // receives data starting at the array tag — same format as GetResponse(Normal).
-            if ((int) this.nRcvPkt[(int) this.bytAddMode + 20] == 130)
+            if ((int) (0xff & this.nRcvPkt[(int) this.bytAddMode + 20]) == 130) // V66: signed-byte mask fix
             {
                 for (int index9 = ((0xff & this.bytAddMode) + 31); index9 < this.pktLength - 1; ++index9)
                     strbldDLMdata.append(Hex2Digit(this.nRcvPkt[index9]));
             }
-            else if ((int) this.nRcvPkt[(int) this.bytAddMode + 20] == 129)
+            else if ((int) (0xff & this.nRcvPkt[(int) this.bytAddMode + 20]) == 129) // V66
             {
                 for (int index9 = ((0xff & this.bytAddMode) + 30); index9 < this.pktLength - 1; ++index9)
                     strbldDLMdata.append(Hex2Digit(this.nRcvPkt[index9]));
@@ -5740,12 +5783,12 @@ public class ReadingSDK {
             }
             if (!flag3)
                 SbData.append("");;
-            if ((int) this.nRcvPkt[(int) this.bytAddMode + 20] == 130)
+            if ((int) (0xff & this.nRcvPkt[(int) this.bytAddMode + 20]) == 130) // V66: signed-byte mask fix
             {
                 for (int index64 = ((0xff & this.bytAddMode) + 23); index64 < this.pktLength - 1; ++index64)
                     strbldDLMdata.append(Hex2Digit(this.nRcvPkt[index64]));
             }
-            else if ((int) this.nRcvPkt[(int) this.bytAddMode + 20] == 129)
+            else if ((int) (0xff & this.nRcvPkt[(int) this.bytAddMode + 20]) == 129) // V66
             {
                 for (int index64 = ((0xff & this.bytAddMode) + 22); index64 < this.pktLength - 1; ++index64)
                     strbldDLMdata.append(Hex2Digit(this.nRcvPkt[index64]));
@@ -6358,10 +6401,10 @@ public class ReadingSDK {
                 }
                 if (!flag3)
                     SbData.append("");
-                if ((int) this.nRcvPkt[(int) this.bytAddMode + 20] == 130) {
+                if ((int) (0xff & this.nRcvPkt[(int) this.bytAddMode + 20]) == 130) { // V66: signed-byte mask fix
                     for (int index21 = ((0xff & this.bytAddMode) + 23); index21 < this.pktLength - 1; ++index21)
                         strbldDLMdata.append(Hex2Digit(this.nRcvPkt[index21]));
-                } else if ((int) this.nRcvPkt[(int) this.bytAddMode + 20] == 129) {
+                } else if ((int) (0xff & this.nRcvPkt[(int) this.bytAddMode + 20]) == 129) { // V66
                     for (int index21 = ((0xff & this.bytAddMode) + 22); index21 < this.pktLength - 1; ++index21)
                         strbldDLMdata.append(Hex2Digit(this.nRcvPkt[index21]));
                 } else {
@@ -6965,10 +7008,10 @@ public class ReadingSDK {
                 }
                 if (!flag3)
                     SbData.append("");
-                if ((int) this.nRcvPkt[(int) this.bytAddMode + 20] == 130) {
+                if ((int) (0xff & this.nRcvPkt[(int) this.bytAddMode + 20]) == 130) { // V66: signed-byte mask fix
                     for (int index21 = ((0xff & this.bytAddMode) + 23); index21 < this.pktLength - 1; ++index21)
                         strbldDLMdata.append(Hex2Digit(this.nRcvPkt[index21]));
-                } else if ((int) this.nRcvPkt[(int) this.bytAddMode + 20] == 129) {
+                } else if ((int) (0xff & this.nRcvPkt[(int) this.bytAddMode + 20]) == 129) { // V66
                     for (int index21 = ((0xff & this.bytAddMode) + 22); index21 < this.pktLength - 1; ++index21)
                         strbldDLMdata.append(Hex2Digit(this.nRcvPkt[index21]));
                 } else {
