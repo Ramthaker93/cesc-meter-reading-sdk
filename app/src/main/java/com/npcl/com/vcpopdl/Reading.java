@@ -1,3 +1,46 @@
+// VERSION: V67 — LP PLAIN FULL-READ FALLBACK + HONEST PARTIAL/BILLING VERDICTS
+// (07-08, evidence: field log SDK_OPTICAL_LOG_950010_Anshuman_Singh, meters KT339182 /
+// KT326986 / KT247345 / KT349245, and EDIS meter KT329683; ported from ReadingSDK.java V68-SDK).
+//
+// ROOT CAUSE (why "re-read required" kept firing and re-reads never cleared it):
+// some firmware does not answer ANY selective-access read on a profile buffer, while
+// every plain attribute read on the very same object succeeds. From the 07-08 log,
+// same meter, same session, same object 0100630100FF:
+//     RLS_CALL attr=3 (capture_objects) -> RLS_RET len=171 result=0   OK
+//     RLS_CALL attr=4 (capture_period)  -> RLS_RET len=10  result=0   OK
+//     RLS_CALL attr=7 (entries_in_use)  -> RLS_RET len=10  result=0   OK  (= 0)
+//     SEL_ENTRY_REQ from=1726 to=1728  (attr=2 + selector 2)
+//        -> GPS_TIMEOUT, nCounter=0 ... LP_END elapsed=102130ms frames=0 kb=0
+// Midnight failed the same way via selector 1 (MIDNIGHT_SEL -> GPS_NO_RESPONSE), while
+// EVENTS — read plainly — completed in 1108ms in that same session. Nameplate, billing
+// and instantaneous were never affected because they are all plain reads. The meter also
+// reports entries_in_use=0 for LP while plainly holding data, so the app could only guess
+// entry windows, and every guess used the one access mode this firmware ignores.
+// This is a DETERMINISTIC firmware trait, not a link incident — a re-read repeats it
+// identically, which is why field time was being consumed for nothing.
+//
+// (1) LP PLAIN FULL-READ FALLBACK — when every selective path yields nothing, retry
+//     0100630100FF attr=2 with NO selective-access descriptor (tryLpPlainFullRead),
+//     exactly as midnight already does at MIDNIGHT_SEL_EMPTY and as the event buffers do.
+//     Same uint32-echo guard as the midnight LS fallback. Markers LP_FULLREAD_START /
+//     _OK / _EMPTY / _SCALAR / _EX. On success the session says "data captured, no re-read
+//     needed" instead of "re-read required"; RLS_LP_INCONCLUSIVE now means BOTH selective
+//     and plain reads failed, i.e. a genuine link problem worth re-reading.
+// (2) BILLING BUFFER CHECK FIXED — hasBillingObj was an OR of CaptureObj/Buffer/EntriesInUse,
+//     so a read carrying the capture list and the entry count but NO data buffer passed
+//     silently. That is exactly KT329683 on 07-08 (CaptureObj=true, Buffer=false,
+//     EntriesInUse=true -> no warning), which uploaded as a complete read holding only the
+//     4 live-snapshot registers. Now applies the rule the midnight check already gets right:
+//     entries_in_use > 0 && buffer absent => VALIDATION_CRITICAL + session warning.
+// (3) PARTIAL LP MADE VISIBLE — LP_PAGE_AUDIT logged "***LOST=n***" and nothing acted on it,
+//     so KT326986 (declared=74 actual=9, repeated across 17+ consecutive days, ~88% of the
+//     interval data gone) finished as a clean read with d4_rows>0, passing every
+//     missing-LP check. Loss is now accumulated and reported once at session end
+//     (SESSION_LP_LOSS; warning at >=10%).
+//
+// NOTE ON UPLOAD POLICY: unchanged and deliberate — the file is still written and pushed
+// when billing completed, even if LP did not. These changes only make the verdict honest;
+// they never withhold a file.
 // VERSION: V66 — V63 CHRONIC-LINK REJECTION REMOVED, REPLACED WITH HEADER STAMP
 // (04-08, evidence from SS09096714 Aug-3/Aug-4 sessions + user's correct challenge;
 // ported from ReadingSDK.java V67-SDK): V63 refused to write the TXT when a session
@@ -529,6 +572,9 @@ public class Reading extends AppCompatActivity {
     // link. linkDirty is set at EVERY abnormal transaction exit; healLink()
     // (AddressInit+SNRM+AARQ+drain, ~1.5s) runs before the next request.
     private boolean linkDirty = false;
+    // V67: cumulative LP record loss across all accepted pages this session — see lpAuditPage().
+    private int lpDeclaredTotal = 0;
+    private int lpLostTotal     = 0;
     private String  linkDirtyReason = "";
     private int     linkHealCount = 0;      // per-session heal counter (diagnostics)
     // (V63's LINK_HEAL_REJECT_THRESHOLD removed in V66 — heals measure the SS-type
@@ -1951,6 +1997,17 @@ public class Reading extends AppCompatActivity {
                         // (not a rejection) — see the V66 changelog entry at the top of this file.
                         if (linkHealCount >= 10)
                             sectionWarnings.add("Link needed " + linkHealCount + " reconnects (typical SS-type day-request quirk; data recovered via fallbacks)");
+                        // V67: partial LP is otherwise invisible — pages that returned far fewer
+                        // records than declared were logged (LOST=n) and then forgotten, so the
+                        // read finished clean. Report it once, with the actual proportion.
+                        if (lpDeclaredTotal > 0 && lpLostTotal > 0) {
+                            int lostPct = (int) Math.round(100.0 * lpLostTotal / lpDeclaredTotal);
+                            appendLog("SESSION_LP_LOSS declared=" + lpDeclaredTotal
+                                    + " lost=" + lpLostTotal + " (" + lostPct + "%)");
+                            if (lostPct >= 10)
+                                sectionWarnings.add("LP incomplete — " + lpLostTotal + " of "
+                                        + lpDeclaredTotal + " declared records missing (" + lostPct + "%)");
+                        }
                         UpdateStatus(CescRajMeterno, "All data OK");
                         publishProgress("INFO|✓ Complete read OK (" + (sessionElapsed/1000) + "s)", "80");
                         break;
@@ -5617,6 +5674,26 @@ public class Reading extends AppCompatActivity {
     }
 
     /** Extract the meter's RTC timestamp from the TXT (OBIS 0.0.1.0.0.255). */
+    /**
+     * V67 — reads a profile object's entries_in_use (attr=7) straight out of the TXT text.
+     * Line form: "0007 0100620100FF 07 0600000009"  ->  06 = uint32 tag, then 8 hex chars.
+     * Returns -1 when the attribute is absent or unparseable (never 0, so callers can tell
+     * "not present" apart from a genuine zero).
+     */
+    private int extractEntriesInUse(String dataUpper, String obisHex) {
+        try {
+            String marker = obisHex.toUpperCase() + " 07 ";
+            int idx = dataUpper.indexOf(marker);
+            if (idx < 0) return -1;
+            int ps = idx + marker.length();
+            int le = dataUpper.indexOf('\n', ps);
+            if (le < 0) le = dataUpper.length();
+            String payload = dataUpper.substring(ps, le).trim().replaceAll("\\s+", "");
+            if (payload.length() < 10 || !payload.startsWith("06")) return -1;
+            return (int) Long.parseLong(payload.substring(2, 10), 16);
+        } catch (Exception ignored) { return -1; }
+    }
+
     private String extractRtc(String dataUpper) {
         try {
             String marker = "0000010000FF 02 ";
@@ -5882,6 +5959,26 @@ public class Reading extends AppCompatActivity {
                 appendLog("VALIDATION_WARN: Billing data (class 7, OBIS 0100620100FF) MISSING");
             }
 
+            // V67: hasBillingObj is an OR of the three, so a read carrying the capture-object
+            // list and the entries-in-use counter but NO data buffer passed silently. That is
+            // exactly what happened to KT329683 on 07-08-2026 (CaptureObj=true, Buffer=false,
+            // EntriesInUse=true -> no warning at all), and the file uploaded as a complete
+            // read holding only the 4 live-snapshot registers instead of the full billing set.
+            // Apply the same rule the midnight check already gets right:
+            //     entries_in_use > 0 but buffer empty  ==>  read failure.
+            if (hasBillingEntries && !hasBillingBuffer) {
+                int bilEiu = extractEntriesInUse(dataStr.toUpperCase(), "0100620100FF");
+                if (bilEiu > 0) {
+                    appendLog("VALIDATION_CRITICAL: Billing entries_in_use=" + bilEiu
+                            + " but buffer (0100620100FF attr=2) absent — billing read FAILED; "
+                            + "only live-snapshot registers will be present");
+                    sectionWarnings.add("Billing buffer missing (meter has " + bilEiu
+                            + " records) — billing incomplete, re-read required");
+                } else {
+                    appendLog("VALIDATION_INFO: Billing buffer absent and entries_in_use=0 — consistent");
+                }
+            }
+
             // BUG-8 FIX: verify mandatory OBIS columns exist inside billing capture object array
             if (hasBillingCaptureObj) {
                 java.util.Map<String, Integer> bilColMap = parseBillingCaptureObjects(dataStr.toUpperCase());
@@ -5957,7 +6054,7 @@ public class Reading extends AppCompatActivity {
     // BK078355/BK069573, 2026-08-01, in a session that came from this app's own
     // AsyncTaskRunner path rather than the metersdk module). Logged at the start of
     // every session (see doInBackground) so this is a one-line grep from now on.
-    private static final String APP_VERSION = "V66";
+    private static final String APP_VERSION = "V67";
 
     // =====================================================================
     // =====================================================================
@@ -10125,6 +10222,16 @@ public class Reading extends AppCompatActivity {
             appendLog("LP_PAGE_AUDIT " + tag + " declared=" + declared + " actual=" + actual
                     + " uniqueTs=" + ts.size() + " range=" + range
                     + ((declared > 0 && declared > actual) ? " ***LOST=" + (declared - actual) + "***" : ""));
+            // V67: LOST= was logged and nothing acted on it, so a read that lost most of its
+            // records still finished as a clean "Complete" and landed in the DB looking healthy
+            // (KT326986, 07-08-2026: declared=74 actual=9 -> LOST=65, repeated across 17+
+            // consecutive days, ~88% of the interval data silently gone, d4_rows>0 so no
+            // missing-LP check ever fired). Accumulate the loss and surface it once at session
+            // end so partial reads are visible instead of passing as complete.
+            if (declared > 0 && declared > actual) {
+                lpDeclaredTotal += declared;
+                lpLostTotal     += (declared - actual);
+            }
         } catch (Exception e) {
             appendLog("LP_PAGE_AUDIT_EX " + tag + ": " + e.getMessage());
         }
@@ -11622,6 +11729,70 @@ public class Reading extends AppCompatActivity {
         return count > 1 ? count : 0;
     }
 
+    /**
+     * V67 — LP PLAIN FULL-READ FALLBACK (ported from ReadingSDK.java V68-SDK).
+     *
+     * Last resort when every selective-access path for LP1 (0100630100FF) has returned
+     * nothing: read attr=2 plainly, with no selective-access descriptor, exactly as the
+     * midnight buffer already does at MIDNIGHT_SEL_EMPTY and as the event buffers do
+     * (EVENT_ATTR2_START/EVENT_ATTR2_OK).
+     *
+     * WHY (field evidence, 07-08-2026, KT339182, log SDK_OPTICAL_LOG_950010_Anshuman_Singh):
+     * on this firmware every PLAIN read of the LP object succeeded on a healthy link —
+     *     RLS_CALL attr=3 (capture_objects) -> RLS_RET len=171 result=0
+     *     RLS_CALL attr=4 (capture_period)  -> RLS_RET len=10  result=0
+     *     RLS_CALL attr=7 (entries_in_use)  -> RLS_RET len=10  result=0
+     * but the instant a selective-access descriptor was attached to attr=2 the meter went
+     * completely silent —
+     *     SEL_ENTRY_REQ from=1726 to=1728 -> GPS_TIMEOUT, nCounter=0
+     *     LP_END elapsed=102130ms frames=0 kb=0
+     * The same meter reports entries_in_use=0 for LP while plainly holding data, so the
+     * app could only estimate entry windows, and every estimate used the one access mode
+     * this firmware ignores. Midnight failed identically (MIDNIGHT_SEL -> GPS_NO_RESPONSE)
+     * while events, read plainly, completed in 1108ms in the same session.
+     *
+     * This is a deterministic firmware trait, not a link incident — which is why the
+     * "re-read required" verdict never cleared on repeat visits and simply consumed field
+     * time. Nameplate/billing/events were never affected because they are all plain reads.
+     *
+     * Returns true (and appends the LP1 attr=2 line) only if real payload came back;
+     * otherwise leaves strbldDLMdata untouched so the caller's existing verdicts apply.
+     */
+    private boolean tryLpPlainFullRead(UsbSerialPort port, StringBuilder strbldDLMdata) {
+        try {
+            relinkIfDirty(port, "LP_FULLREAD:0100630100FF:a2");
+            appendLog("LP_FULLREAD_START obis=0100630100FF attr=2 — selective access yielded nothing; "
+                    + "retrying as a plain full read (no selective-access descriptor)");
+            long t0 = System.currentTimeMillis();
+            StringBuilder lpFullSb = new StringBuilder();
+            StringBuilder res = this.GetParameter_LS(port, (byte) 7, "0100630100FF", (byte) 2,
+                    this.bytWait, this.bytTryCnt, this.bytTimOut, true, lpFullSb);
+            long elapsed = System.currentTimeMillis() - t0;
+            if (!hasMeaningfulDlmsPayload(res)) {
+                appendLog("LP_FULLREAD_EMPTY elapsed=" + elapsed + "ms — plain read returned no payload either");
+                return false;
+            }
+            // Same uint32-echo guard the midnight LS fallback applies: some firmware
+            // echoes entries_in_use as a bare uint32 instead of the buffer.
+            String[] tok = res.toString().trim().split("\\s+");
+            String last = tok[tok.length - 1].toUpperCase();
+            if (last.length() == 10 && last.startsWith("06")) {
+                appendLog("LP_FULLREAD_SCALAR: uint32 echo 0x" + last.substring(2)
+                        + " — meter returned EIU as a scalar, not the buffer; discarding");
+                return false;
+            }
+            strbldDLMdata.append(lpFullSb);
+            appendLog("LP_FULLREAD_OK elapsed=" + elapsed + "ms chars=" + lpFullSb.length()
+                    + " — LP recovered by plain read; meter does not honour selective access");
+            sectionWarnings.add("LP read via plain full-read fallback (meter ignores selective access) "
+                    + "— data captured, no re-read needed");
+            return true;
+        } catch (Exception ex) {
+            appendLog("LP_FULLREAD_EX: " + ex.getMessage());
+            return false;
+        }
+    }
+
     private boolean hasMeaningfulDlmsPayload(StringBuilder data) {
         if (data == null) return false;
         String text = data.toString();
@@ -12722,6 +12893,9 @@ public class Reading extends AppCompatActivity {
                 strbldDLMdata.append("\r\n0007 0100630100FF 02 ").append(mergedLp);
                 appendLog("RLS_LP_MERGED pages=" + lpPageHexList.size() + " totalRecords=" + totalActualRecords);
             }
+        } else if (tryLpPlainFullRead(port, strbldDLMdata)) {
+            // V67: recovered by the plain full attr=2 read — see tryLpPlainFullRead().
+            // Nothing further to do; the LP1 line has already been appended.
         } else if (!probeLinkFailed) {
             // V30: always write LP1 attr=02 even when buffer is empty, so the .NET
             // converter knows LP1 was checked. "0100" = DLMS array with 0 elements.
@@ -12734,10 +12908,10 @@ public class Reading extends AppCompatActivity {
             else
                 sectionWarnings.add("LP empty (meter reports no interval data)");
         } else {
-            // V59: probe was inconclusive — do NOT assert LP is empty; omit LP1
-            // entirely so the file honestly reflects "not checked" rather than a
-            // false zero.
-            appendLog("RLS_LP_INCONCLUSIVE — link failure during empty-probe; LP1 omitted, re-read required");
+            // V67: the plain full read above also failed, so selective access AND the
+            // plain path both drew silence — that is a link/meter problem, not the
+            // selective-access trait, and a re-read genuinely may help.
+            appendLog("RLS_LP_INCONCLUSIVE — selective access and plain full read both failed; LP1 omitted, re-read required");
             sectionWarnings.add("LP could not be verified (link failures during probe) — re-read required");
         }
 
